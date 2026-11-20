@@ -26,7 +26,9 @@ local S = {
     tracers = {},
     tracerAttachment = nil,
     gui = nil,
-    originalLighting = nil
+    originalLighting = nil,
+    staminaController = nil,
+    restoreFOV = nil
 }
 
 env[KEY] = S
@@ -337,6 +339,11 @@ function S:Destroy()
     if self.destroyed then return end
     self.destroyed = true
 
+    if self.staminaController then
+        pcall(function() self.staminaController:Destroy() end)
+        self.staminaController = nil
+    end
+    if self.restoreFOV then pcall(self.restoreFOV) end
     if self.gui then pcall(function() self.gui:Destroy() end) end
     if self.tracerAttachment then pcall(function() self.tracerAttachment:Destroy() end) end
     for _, beam in pairs(self.tracers) do pcall(function() beam:Destroy() end) end
@@ -1190,16 +1197,290 @@ Controller:Connect(
 )
 end
 
-print("VICK ESP + Auto Skill Check + Billboard raros carregado")
+-- ESP, Auto Skill Check e billboard de monstros inicializados
 
 
 
--- PAINEL UNIFICADO VICK | F6
+
+-- SISTEMA DE STAMINA: adaptado exclusivamente da rotina SprintEvent/Sprinting
+-- do script fornecido pelo usuario; demais ESPs do script de origem nao sao usados.
+do
+    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local sprintEvent
+    local character, humanoid, sprinting, normalWalkSpeed
+    local sprintHeld = false
+    local controllerSprintHeld = false
+    local mobileSprintHeld = false
+    local mobileRun, mobileConnection
+    local originalSprintConnections = {}
+    local originalMobileConnections = {}
+    local savedInterface = {}
+
+    local Stamina = {
+        enabled = false,
+        destroyed = false,
+        connections = {},
+    }
+    S.staminaController = Stamina
+
+    local function staminaConnect(signal, callback)
+        if Stamina.destroyed then return nil end
+        local c = signal:Connect(callback)
+        table.insert(Stamina.connections, c)
+        return c
+    end
+
+    local function findSprintEvent()
+        local events = ReplicatedStorage:FindFirstChild("Events")
+        sprintEvent = events and events:FindFirstChild("SprintEvent") or nil
+        if sprintEvent and not sprintEvent:IsA("RemoteEvent") then sprintEvent = nil end
+    end
+
+    local function refreshCharacter(char)
+        character = char
+        humanoid = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
+        local stats = char:FindFirstChild("Stats") or char:WaitForChild("Stats", 10)
+        sprinting = stats and stats:FindFirstChild("Sprinting") or nil
+        normalWalkSpeed = humanoid and humanoid.WalkSpeed or nil
+        sprintHeld, controllerSprintHeld, mobileSprintHeld = false, false, false
+    end
+
+    local function setConnectionsEnabled(list, value)
+        for _, connection in ipairs(list) do
+            pcall(function()
+                if value then connection:Enable() else connection:Disable() end
+            end)
+        end
+    end
+
+    local function captureConnections(signal, storage)
+        if not signal or type(getconnections) ~= "function" then return end
+        local ok, list = pcall(getconnections, signal)
+        if not ok or type(list) ~= "table" then return end
+        for _, connection in ipairs(list) do
+            local ours = (connection == mobileConnection)
+            if not ours then
+                local found = false
+                for _, recorded in ipairs(storage) do
+                    if recorded == connection then found = true break end
+                end
+                if not found then table.insert(storage, connection) end
+            end
+        end
+    end
+
+    local function isSprintWanted()
+        return Stamina.enabled and (sprintHeld or controllerSprintHeld or mobileSprintHeld)
+    end
+
+    -- Velocidade e flag Sprinting iguais as usadas pelo script enviado.
+    local function getRunSpeed()
+        local maxSpeed = LocalPlayer:GetAttribute("KM_MAX_PLAYER_SPEED")
+        if type(maxSpeed) == "number" and maxSpeed > 0 then return maxSpeed end
+        return humanoid and humanoid.Parent and humanoid.WalkSpeed or nil
+    end
+
+    local function applySpeedState()
+        if not humanoid or not humanoid.Parent or not normalWalkSpeed then return end
+        if isSprintWanted() then
+            local runSpeed = getRunSpeed()
+            if type(runSpeed) == "number" and runSpeed > 0 then
+                humanoid.WalkSpeed = runSpeed
+            end
+        else
+            humanoid.WalkSpeed = normalWalkSpeed
+        end
+    end
+
+    local function setSprintInterface(active)
+        local screenGui = PlayerGui:FindFirstChild("ScreenGui")
+        local runButton = screenGui and screenGui:FindFirstChild("MobileRun")
+        if not runButton then return end
+        local text = runButton:FindFirstChild("TextLabel")
+        if text then text.Text = active and "SPRINT: ON" or "SPRINT: OFF" end
+        pcall(function()
+            runButton.Image = active and "rbxassetid://11866539249"
+                or "rbxassetid://11866517702"
+        end)
+        local icon = screenGui:FindFirstChild("SprintIcon")
+        if icon and active then icon.Visible = false end
+    end
+
+    local function restoreSprintInterface()
+        for object, values in pairs(savedInterface) do
+            if object and object.Parent then
+                for property, value in pairs(values) do
+                    pcall(function() object[property] = value end)
+                end
+            end
+            savedInterface[object] = nil
+        end
+    end
+
+    local function rememberInterface()
+        local screenGui = PlayerGui:FindFirstChild("ScreenGui")
+        local runButton = screenGui and screenGui:FindFirstChild("MobileRun")
+        if not runButton then return end
+        if not savedInterface[runButton] then
+            local values = {}
+            pcall(function() values.Image = runButton.Image end)
+            savedInterface[runButton] = values
+        end
+        local text = runButton:FindFirstChild("TextLabel")
+        if text and not savedInterface[text] then savedInterface[text] = { Text = text.Text } end
+        local icon = screenGui:FindFirstChild("SprintIcon")
+        if icon and not savedInterface[icon] then savedInterface[icon] = { Visible = icon.Visible } end
+    end
+
+    local function sendSprint(value)
+        if not sprintEvent then findSprintEvent() end
+        if sprintEvent then
+            pcall(function() sprintEvent:FireServer(value) end)
+        end
+    end
+
+    local function startSprint()
+        if not Stamina.enabled then return end
+        if sprinting and sprinting.Parent then
+            pcall(function() sprinting.Value = true end)
+        end
+        applySpeedState()
+        setSprintInterface(true)
+        sendSprint(true)
+    end
+
+    local function stopSprint()
+        if sprinting and sprinting.Parent then
+            pcall(function() sprinting.Value = false end)
+        end
+        setSprintInterface(false)
+        sendSprint(false)
+        applySpeedState()
+    end
+
+    local function bindMobileRun()
+        local screenGui = PlayerGui:FindFirstChild("ScreenGui")
+        local button = screenGui and screenGui:FindFirstChild("MobileRun")
+        if button == mobileRun then return end
+        if mobileConnection then
+            mobileConnection:Disconnect()
+            mobileConnection = nil
+        end
+        if Stamina.enabled then setConnectionsEnabled(originalMobileConnections, true) end
+        table.clear(originalMobileConnections)
+        mobileRun = button
+        mobileSprintHeld = false
+        if not button then return end
+        -- Capture conexoes originais ANTES de conectar nosso proprio botao.
+        captureConnections(button.Activated, originalMobileConnections)
+        mobileConnection = staminaConnect(button.Activated, function()
+            if not Stamina.enabled then return end
+            mobileSprintHeld = not mobileSprintHeld
+            if mobileSprintHeld then startSprint() else stopSprint() end
+        end)
+        if Stamina.enabled then
+            setConnectionsEnabled(originalMobileConnections, false)
+            rememberInterface()
+        end
+    end
+
+    function Stamina:SetEnabled(value)
+        if self.destroyed or self.enabled == value then return end
+        self.enabled = value
+        if value then
+            findSprintEvent()
+            if sprintEvent then
+                captureConnections(sprintEvent.OnClientEvent, originalSprintConnections)
+                setConnectionsEnabled(originalSprintConnections, false)
+            end
+            bindMobileRun()
+            setConnectionsEnabled(originalMobileConnections, false)
+            rememberInterface()
+            if isSprintWanted() then startSprint() else applySpeedState() end
+        else
+            sprintHeld, controllerSprintHeld, mobileSprintHeld = false, false, false
+            stopSprint()
+            setConnectionsEnabled(originalSprintConnections, true)
+            setConnectionsEnabled(originalMobileConnections, true)
+            restoreSprintInterface()
+        end
+    end
+
+    function Stamina:Destroy()
+        if self.destroyed then return end
+        if self.enabled then self:SetEnabled(false) end
+        self.destroyed = true
+        for _, c in ipairs(self.connections) do
+            pcall(function() c:Disconnect() end)
+        end
+        table.clear(self.connections)
+        if S.staminaController == self then S.staminaController = nil end
+    end
+
+    refreshCharacter(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())
+    findSprintEvent()
+    bindMobileRun()
+
+    staminaConnect(LocalPlayer.CharacterAdded, function(char)
+        refreshCharacter(char)
+        task.defer(function()
+            if Stamina.destroyed then return end
+            bindMobileRun()
+            if Stamina.enabled then applySpeedState() end
+        end)
+    end)
+
+    staminaConnect(PlayerGui.DescendantAdded, function(object)
+        if object.Name == "MobileRun" then
+            task.defer(function()
+                if not Stamina.destroyed then bindMobileRun() end
+            end)
+        end
+    end)
+
+    -- Teclas de movimento continuam funcionando como corrida, nao como
+    -- atalhos de ligar/desligar funcionalidades. O toggle fica so no F6.
+    staminaConnect(UIS.InputBegan, function(input, processed)
+        if processed or not Stamina.enabled then return end
+        if input.KeyCode == Enum.KeyCode.LeftShift then
+            if not sprintHeld then sprintHeld = true startSprint() end
+        elseif input.KeyCode == Enum.KeyCode.ButtonR1 then
+            if not controllerSprintHeld then controllerSprintHeld = true startSprint() end
+        end
+    end)
+
+    staminaConnect(UIS.InputEnded, function(input)
+        if not Stamina.enabled then return end
+        if input.KeyCode == Enum.KeyCode.LeftShift then
+            sprintHeld = false
+            if not controllerSprintHeld and not mobileSprintHeld then stopSprint() end
+        elseif input.KeyCode == Enum.KeyCode.ButtonR1 then
+            controllerSprintHeld = false
+            if not sprintHeld and not mobileSprintHeld then stopSprint() end
+        end
+    end)
+
+    task.spawn(function()
+        while not Stamina.destroyed do
+            if Stamina.enabled then
+                if isSprintWanted() then
+                    if sprinting and sprinting.Parent then
+                        pcall(function() sprinting.Value = true end)
+                    end
+                    applySpeedState()
+                end
+            end
+            task.wait(0.22)
+        end
+    end)
+end
+
+-- PAINEL UNIFICADO DW | F6
 do
     local RunService = game:GetService("RunService")
     local Lighting = game:GetService("Lighting")
     local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-    local old = PlayerGui:FindFirstChild("__VICK_UNIFIED_PANEL")
+    local old = PlayerGui:FindFirstChild("__DW_PANEL_F6")
     if old then old:Destroy() end
 
     local flags = {
@@ -1211,11 +1492,16 @@ do
         ItemTracer = false,
         RareBillboard = true,
         AutoSkill = S.skillEnabled,
+        InfiniteStamina = false,
         FullBright = false,
         FOV = false,
     }
     local camera = workspace.CurrentCamera
     local initialFOV = camera and camera.FieldOfView or 70
+    S.restoreFOV = function()
+        local cam = workspace.CurrentCamera
+        if cam and flags.FOV then cam.FieldOfView = initialFOV end
+    end
     local targetFOV = math.clamp(math.floor(initialFOV + 0.5), 40, 120)
     local lightProperties = {"Brightness", "ClockTime", "FogEnd", "GlobalShadows", "Ambient"}
     S.originalLighting = {}
@@ -1318,6 +1604,8 @@ do
             end
         elseif key == "AutoSkill" then
             setSkillEnabled(value)
+        elseif key == "InfiniteStamina" then
+            if S.staminaController then S.staminaController:SetEnabled(value) end
         elseif key == "FullBright" then
             applyLighting()
         elseif key == "FOV" then
@@ -1329,7 +1617,7 @@ do
     end
 
     local gui = Instance.new("ScreenGui")
-    gui.Name = "__VICK_UNIFIED_PANEL"
+    gui.Name = "__DW_PANEL_F6"
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = false
     gui.DisplayOrder = 150
@@ -1340,14 +1628,14 @@ do
     panel.Name = "Panel"
     panel.Size = UDim2.fromOffset(330, 490)
     panel.Position = UDim2.new(1, -350, 0.14, 0)
-    panel.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
+    panel.BackgroundColor3 = Color3.fromRGB(9, 9, 9)
     panel.BorderSizePixel = 0
     panel.Active = true
     panel.Parent = gui
     local corner = Instance.new("UICorner", panel)
     corner.CornerRadius = UDim.new(0, 12)
     local outline = Instance.new("UIStroke", panel)
-    outline.Color = Color3.fromRGB(68, 82, 103)
+    outline.Color = Color3.fromRGB(190, 190, 190)
     outline.Thickness = 1
 
     local header = Instance.new("Frame")
@@ -1360,8 +1648,8 @@ do
     title.Size = UDim2.new(1, -65, 1, 0)
     title.Position = UDim2.fromOffset(15, 0)
     title.BackgroundTransparency = 1
-    title.Text = "VICK  |  CONTROLES"
-    title.TextColor3 = Color3.fromRGB(241, 245, 252)
+    title.Text = "Painel DW"
+    title.TextColor3 = Color3.fromRGB(250, 250, 250)
     title.TextSize = 15
     title.Font = Enum.Font.GothamBold
     title.TextXAlignment = Enum.TextXAlignment.Left
@@ -1370,7 +1658,7 @@ do
     local close = Instance.new("TextButton")
     close.Size = UDim2.fromOffset(29, 29)
     close.Position = UDim2.new(1, -39, 0, 8)
-    close.BackgroundColor3 = Color3.fromRGB(46, 52, 65)
+    close.BackgroundColor3 = Color3.fromRGB(38, 38, 38)
     close.Text = "X"
     close.TextColor3 = Color3.new(1, 1, 1)
     close.TextSize = 13
@@ -1385,7 +1673,7 @@ do
     scroll.BackgroundTransparency = 1
     scroll.BorderSizePixel = 0
     scroll.ScrollBarThickness = 4
-    scroll.ScrollBarImageColor3 = Color3.fromRGB(95, 115, 148)
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(170, 170, 170)
     scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
     scroll.CanvasSize = UDim2.fromOffset(0, 0)
     scroll.Parent = panel
@@ -1399,7 +1687,7 @@ do
         label.Size = UDim2.new(1, -5, 0, height)
         label.BackgroundTransparency = 1
         label.Text = text
-        label.TextColor3 = Color3.fromRGB(145, 165, 191)
+        label.TextColor3 = Color3.fromRGB(175, 175, 175)
         label.TextSize = 11
         label.Font = Enum.Font.GothamBold
         label.TextXAlignment = Enum.TextXAlignment.Left
@@ -1410,7 +1698,7 @@ do
     local function makeToggle(labelText, key)
         local row = Instance.new("Frame")
         row.Size = UDim2.new(1, -6, 0, 35)
-        row.BackgroundColor3 = Color3.fromRGB(32, 37, 49)
+        row.BackgroundColor3 = Color3.fromRGB(27, 27, 27)
         row.BorderSizePixel = 0
         row.Parent = scroll
         Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
@@ -1420,7 +1708,7 @@ do
         label.Position = UDim2.fromOffset(11, 0)
         label.BackgroundTransparency = 1
         label.Text = labelText
-        label.TextColor3 = Color3.fromRGB(231, 237, 247)
+        label.TextColor3 = Color3.fromRGB(238, 238, 238)
         label.TextSize = 12
         label.Font = Enum.Font.GothamMedium
         label.TextXAlignment = Enum.TextXAlignment.Left
@@ -1437,7 +1725,9 @@ do
         local function paint()
             button.Text = flags[key] and "ON" or "OFF"
             button.BackgroundColor3 = flags[key]
-                and Color3.fromRGB(34, 143, 100) or Color3.fromRGB(118, 57, 68)
+                and Color3.fromRGB(245, 245, 245) or Color3.fromRGB(57, 57, 57)
+            button.TextColor3 = flags[key]
+                and Color3.fromRGB(12, 12, 12) or Color3.fromRGB(245, 245, 245)
         end
         paint()
         connect(button.MouseButton1Click, function()
@@ -1447,22 +1737,23 @@ do
     end
 
     textLabel("ESP", 19)
-    makeToggle("Geradores (azul)", "GeneratorESP")
-    makeToggle("Twisteds (vermelho)", "MonsterESP")
-    makeToggle("Jogadores (verde)", "PlayerESP")
+    makeToggle("Geradores", "GeneratorESP")
+    makeToggle("Twisteds", "MonsterESP")
+    makeToggle("Jogadores", "PlayerESP")
     makeToggle("Info jogadores / HP", "PlayerInfo")
-    makeToggle("Itens (amarelo)", "ItemESP")
+    makeToggle("Itens", "ItemESP")
     makeToggle("Tracer dos itens", "ItemTracer")
     textLabel("EXTRAS", 19)
     makeToggle("Billboard Scraps / Goob / Gigi", "RareBillboard")
     makeToggle("Auto Skill Check", "AutoSkill")
+    makeToggle("Infinite Stamina", "InfiniteStamina")
     makeToggle("FullBright", "FullBright")
     makeToggle("FOV personalizado", "FOV")
 
     textLabel("FOV  |  40 a 120", 20)
     local fovRow = Instance.new("Frame")
     fovRow.Size = UDim2.new(1, -6, 0, 38)
-    fovRow.BackgroundColor3 = Color3.fromRGB(32, 37, 49)
+    fovRow.BackgroundColor3 = Color3.fromRGB(27, 27, 27)
     fovRow.BorderSizePixel = 0
     fovRow.Parent = scroll
     Instance.new("UICorner", fovRow).CornerRadius = UDim.new(0, 7)
@@ -1471,7 +1762,7 @@ do
         local b = Instance.new("TextButton")
         b.Size = UDim2.fromOffset(w, 28)
         b.Position = UDim2.fromOffset(x, 5)
-        b.BackgroundColor3 = Color3.fromRGB(51, 63, 82)
+        b.BackgroundColor3 = Color3.fromRGB(62, 62, 62)
         b.Text = txt
         b.TextColor3 = Color3.new(1, 1, 1)
         b.Font = Enum.Font.GothamBold
@@ -1486,7 +1777,7 @@ do
     local valueBox = Instance.new("TextBox")
     valueBox.Size = UDim2.fromOffset(164, 28)
     valueBox.Position = UDim2.fromOffset(49, 5)
-    valueBox.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
+    valueBox.BackgroundColor3 = Color3.fromRGB(9, 9, 9)
     valueBox.TextColor3 = Color3.new(1, 1, 1)
     valueBox.Font = Enum.Font.GothamBold
     valueBox.TextSize = 14
@@ -1511,7 +1802,7 @@ do
     hint.Size = UDim2.new(1, -28, 0, 18)
     hint.BackgroundTransparency = 1
     hint.Text = "F6: mostrar / esconder  •  arraste pelo titulo"
-    hint.TextColor3 = Color3.fromRGB(147, 159, 179)
+    hint.TextColor3 = Color3.fromRGB(160, 160, 160)
     hint.Font = Enum.Font.Gotham
     hint.TextSize = 10
     hint.Parent = panel
@@ -1555,4 +1846,4 @@ do
         if flags.FullBright then applyLighting() end
     end)
 end
-print("[VICK] Painel unificado carregado | F6 abre/fecha")
+print("[Painel DW] F6 abre/fecha | Stamina, ESP, FOV e extras")
