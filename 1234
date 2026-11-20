@@ -1,0 +1,1558 @@
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local CurrentRoom = workspace:WaitForChild("CurrentRoom")
+
+local env = getgenv and getgenv() or _G
+local KEY = "__ESP_4_CORES"
+
+if env[KEY] and type(env[KEY].Destroy) == "function" then
+    pcall(function()
+        env[KEY]:Destroy()
+    end)
+end
+
+local S = {
+    destroyed = false,
+    connections = {},
+    highlights = {},
+    billboards = {},
+    rareBillboardController = nil,
+    skillRemote = nil,
+    originalSkillCallback = nil,
+    skillEnabled = true,
+    playerInfoEnabled = true,
+    tracers = {},
+    tracerAttachment = nil,
+    gui = nil,
+    originalLighting = nil
+}
+
+env[KEY] = S
+
+local colors = {
+    GeneratorESP = Color3.fromRGB(0, 170, 255),
+    MonsterESP = Color3.fromRGB(255, 45, 45),
+    PlayerESP = Color3.fromRGB(0, 255, 90),
+    ItemESP = Color3.fromRGB(255, 225, 0)
+}
+
+local enabled = {
+    GeneratorESP = true,
+    MonsterESP = true,
+    PlayerESP = true,
+    ItemESP = true
+}
+
+local tracked = {
+    GeneratorESP = setmetatable({}, {__mode = "k"}),
+    MonsterESP = setmetatable({}, {__mode = "k"}),
+    PlayerESP = setmetatable({}, {__mode = "k"}),
+    ItemESP = setmetatable({}, {__mode = "k"})
+}
+
+local boundRooms = setmetatable({}, {__mode = "k"})
+local boundFolders = setmetatable({}, {__mode = "k"})
+local boundGenerators = setmetatable({}, {__mode = "k"})
+local boundBlots = setmetatable({}, {__mode = "k"})
+local boundPlayers = setmetatable({}, {__mode = "k"})
+
+local function connect(signal, callback)
+    if S.destroyed then return nil end
+    local connection = signal:Connect(callback)
+    table.insert(S.connections, connection)
+    return connection
+end
+
+local function createHighlight(item, name, transparency)
+    if S.destroyed or not item or not item.Parent then return nil end
+
+    local highlightName = name == "PlayerESP"
+        and "__DistrairPlayerHighlight" or name
+
+    local h = item:FindFirstChild(highlightName)
+    if not h or not h:IsA("Highlight") then
+        h = Instance.new("Highlight")
+        h.Name = highlightName
+        h.Parent = item
+    end
+
+    h.Adornee = item
+    h.FillColor = colors[name]
+    h.OutlineColor = colors[name]
+    h.FillTransparency = transparency
+    h.OutlineTransparency = 0
+    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    h.Enabled = enabled[name]
+    tracked[name][h] = true
+    S.highlights[h] = true
+    return h
+end
+
+local function addGenerator(item)
+    if S.destroyed or not item or boundGenerators[item] then return end
+    boundGenerators[item] = true
+
+    local stats = item:FindFirstChild("Stats")
+    local completed = stats and stats:FindFirstChild("Completed")
+    if completed and completed.Value == true then return end
+
+    local h = createHighlight(item, "GeneratorESP", 0.68)
+
+    if completed then
+        connect(completed:GetPropertyChangedSignal("Value"), function()
+            if completed.Value == true and h and h.Parent then
+                tracked.GeneratorESP[h] = nil
+                h:Destroy()
+            end
+        end)
+    end
+end
+
+local function onAdded(item)
+    if S.destroyed or not item or not item.Parent then return end
+    local parentName = item.Parent.Name
+
+    if parentName == "Generators" or item.Name == "Generator" then
+        addGenerator(item)
+    elseif parentName == "Items" then
+        if not item.Name:find("Capsule") then
+            createHighlight(item, "ItemESP", 0.25)
+        end
+    elseif parentName == "Monsters" then
+        createHighlight(item, "MonsterESP", 0.68)
+    end
+end
+
+local function highlightBlotHand(hand)
+    task.spawn(function()
+        local arm = hand:WaitForChild("Arm", 5)
+        if arm and not S.destroyed then
+            createHighlight(arm, "MonsterESP", 0.68)
+        end
+    end)
+end
+
+local function bindBlot(entity)
+    if not entity:IsA("Part")
+        or not entity.Name:find("BlotHandZone")
+        or boundBlots[entity] then return end
+
+    boundBlots[entity] = true
+    connect(entity.ChildAdded, function(child)
+        if child:IsA("Model") then
+            highlightBlotHand(child)
+        end
+    end)
+
+    for _, child in ipairs(entity:GetChildren()) do
+        if child:IsA("Model") then
+            highlightBlotHand(child)
+        end
+    end
+end
+
+local function bindFolder(folder)
+    if boundFolders[folder] then return end
+    boundFolders[folder] = true
+    connect(folder.ChildAdded, onAdded)
+    for _, item in ipairs(folder:GetChildren()) do
+        onAdded(item)
+    end
+end
+
+local function bindRoomChild(child)
+    if child.Name == "Monsters"
+        or child.Name == "Generators"
+        or child.Name == "Items" then
+        bindFolder(child)
+    end
+    if child.Name == "Generator" then
+        onAdded(child)
+    end
+    bindBlot(child)
+end
+
+local function bindRoom(room)
+    if not room:IsA("Model") or boundRooms[room] then return end
+    boundRooms[room] = true
+    connect(room.ChildAdded, bindRoomChild)
+    for _, child in ipairs(room:GetChildren()) do
+        bindRoomChild(child)
+    end
+end
+
+local function getRoot(char)
+    return char and (
+        char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+        or char.PrimaryPart
+    )
+end
+
+local function createPlayerBillboard(player, root)
+    local name = "__DistrairPlayerBillboard"
+    local bill = root:FindFirstChild(name)
+    if not bill or not bill:IsA("BillboardGui") then
+        bill = Instance.new("BillboardGui")
+        bill.Name = name
+        bill.Parent = root
+    end
+
+    bill.Adornee = root
+    bill.AlwaysOnTop = true
+    bill.LightInfluence = 0
+    bill.MaxDistance = 0
+    bill.Size = UDim2.fromOffset(155, 44)
+    bill.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
+    bill.Enabled = enabled.PlayerESP and S.playerInfoEnabled
+
+    local holder = bill:FindFirstChild("Holder")
+    if not holder then
+        holder = Instance.new("Frame")
+        holder.Name = "Holder"
+        holder.Parent = bill
+    end
+
+    holder.Size = UDim2.fromScale(1, 1)
+    holder.BackgroundColor3 = Color3.fromRGB(12, 12, 14)
+    holder.BackgroundTransparency = 0.35
+    holder.BorderSizePixel = 0
+
+    if not holder:FindFirstChildOfClass("UICorner") then
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 5)
+        corner.Parent = holder
+    end
+
+    local stroke = holder:FindFirstChildOfClass("UIStroke")
+    if not stroke then
+        stroke = Instance.new("UIStroke")
+        stroke.Parent = holder
+    end
+    stroke.Color = colors.PlayerESP
+    stroke.Thickness = 1
+    stroke.Transparency = 0.15
+
+    local function label(labelName, y, height, size, font)
+        local obj = holder:FindFirstChild(labelName)
+        if not obj or not obj:IsA("TextLabel") then
+            obj = Instance.new("TextLabel")
+            obj.Name = labelName
+            obj.Parent = holder
+        end
+        obj.BackgroundTransparency = 1
+        obj.Position = UDim2.fromOffset(3, y)
+        obj.Size = UDim2.new(1, -6, 0, height)
+        obj.Font = font
+        obj.TextSize = size
+        obj.TextStrokeTransparency = 0.45
+        return obj
+    end
+
+    local nameLabel = label("Name", 1, 20, 12, Enum.Font.GothamBold)
+    nameLabel.TextColor3 = colors.PlayerESP
+    nameLabel.Text = player.DisplayName ~= player.Name
+        and (player.DisplayName .. " @" .. player.Name)
+        or player.Name
+
+    local info = label("Info", 20, 18, 10, Enum.Font.Gotham)
+    info.TextColor3 = Color3.fromRGB(245, 245, 245)
+    S.billboards[bill] = true
+    return info
+end
+
+local function updatePlayer(player)
+    if S.destroyed or player == LocalPlayer then return end
+    local char = player.Character
+    local root = getRoot(char)
+    if not char or not root then return end
+
+    createHighlight(char, "PlayerESP", 0.78)
+    local info = createPlayerBillboard(player, root)
+    local myRoot = getRoot(LocalPlayer.Character)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    if info and myRoot then
+        local distance = math.floor((root.Position - myRoot.Position).Magnitude + 0.5)
+        local hp = hum and math.floor(hum.Health + 0.5) or 0
+        info.Text = tostring(distance) .. "m | HP " .. tostring(hp)
+    end
+end
+
+local function bindPlayer(player)
+    if player == LocalPlayer or boundPlayers[player] then return end
+    boundPlayers[player] = true
+    connect(player.CharacterAdded, function()
+        task.wait(0.35)
+        if not S.destroyed then updatePlayer(player) end
+    end)
+    updatePlayer(player)
+end
+
+local function toggleESP(name)
+    enabled[name] = not enabled[name]
+    for h in pairs(tracked[name]) do
+        if h and h.Parent then
+            h.Enabled = enabled[name]
+            h.FillColor = colors[name]
+            h.OutlineColor = colors[name]
+            h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        else
+            tracked[name][h] = nil
+        end
+    end
+    if name == "PlayerESP" then
+        for bill in pairs(S.billboards) do
+            if bill and bill.Parent then
+                bill.Enabled = enabled.PlayerESP and S.playerInfoEnabled
+            else
+                S.billboards[bill] = nil
+            end
+        end
+    end
+end
+
+local function supercompleteCallback(...)
+    return "supercomplete"
+end
+
+local function setSkillEnabled(value)
+    S.skillEnabled = value
+    if not S.skillRemote then return end
+
+    local ok, err = pcall(function()
+        S.skillRemote.OnClientInvoke = value
+            and supercompleteCallback
+            or S.originalSkillCallback
+    end)
+    if not ok then
+        warn("Auto Skill Check: " .. tostring(err))
+    end
+end
+
+function S:Destroy()
+    if self.destroyed then return end
+    self.destroyed = true
+
+    if self.gui then pcall(function() self.gui:Destroy() end) end
+    if self.tracerAttachment then pcall(function() self.tracerAttachment:Destroy() end) end
+    for _, beam in pairs(self.tracers) do pcall(function() beam:Destroy() end) end
+    if self.originalLighting then
+        local lighting = game:GetService("Lighting")
+        for property, value in pairs(self.originalLighting) do pcall(function() lighting[property] = value end) end
+    end
+    if self.rareBillboardController then
+        pcall(function() self.rareBillboardController:Destroy() end)
+        self.rareBillboardController = nil
+    end
+
+    for _, connection in ipairs(self.connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    for h in pairs(self.highlights) do
+        pcall(function() h:Destroy() end)
+    end
+    for bill in pairs(self.billboards) do
+        pcall(function() bill:Destroy() end)
+    end
+    if self.skillRemote then
+        pcall(function()
+            self.skillRemote.OnClientInvoke = self.originalSkillCallback
+        end)
+    end
+    if env[KEY] == self then env[KEY] = nil end
+end
+
+for _, room in ipairs(CurrentRoom:GetChildren()) do
+    bindRoom(room)
+end
+connect(CurrentRoom.ChildAdded, bindRoom)
+
+for _, player in ipairs(Players:GetPlayers()) do
+    bindPlayer(player)
+end
+connect(Players.PlayerAdded, bindPlayer)
+
+
+task.spawn(function()
+    while not S.destroyed do
+        if enabled.PlayerESP then
+            for _, player in ipairs(Players:GetPlayers()) do
+                updatePlayer(player)
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+task.spawn(function()
+    local events = ReplicatedStorage:WaitForChild("Events", 10)
+    if S.destroyed or not events then return end
+
+    local remote = events:WaitForChild("SkillcheckUpdate", 10)
+    if S.destroyed or not remote or not remote:IsA("RemoteFunction") then
+        warn("Auto Skill Check: SkillcheckUpdate indisponivel")
+        return
+    end
+
+    S.skillRemote = remote
+    local original = nil
+    if type(getcallbackvalue) == "function" then
+        local ok, callback = pcall(getcallbackvalue, remote, "OnClientInvoke")
+        if ok and type(callback) == "function" then
+            original = callback
+        end
+    end
+    if not original then
+        local ok, callback = pcall(function()
+            return remote.OnClientInvoke
+        end)
+        if ok and type(callback) == "function" then
+            original = callback
+        end
+    end
+    S.originalSkillCallback = original
+    setSkillEnabled(S.skillEnabled)
+end)
+
+-- Billboard de cooldown para Scraps, Goob e Gigi (do segundo script).
+-- Separado do billboard de jogadores e integrado ao ciclo de vida do ESP.
+do
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local TOGGLE_KEY = Enum.KeyCode.KeypadSix
+local BILLBOARD_NAME = "__RareGrabCooldownBillboard"
+
+local MONSTER_CONFIG = {
+    ScrapsMonster = {
+        displayName = "SCRAPS",
+        cooldown = 12,
+        readyText = "GRAB READY",
+        activeText = "GRABBING",
+        windupTimeout = 2.5,
+    },
+
+    GoobMonster = {
+        displayName = "GOOB",
+        cooldown = 10,
+        readyText = "GRAB READY",
+        activeText = "GRABBING",
+        windupTimeout = 2.0,
+    },
+
+    GigiMonster = {
+        displayName = "GIGI",
+        cooldown = 10,
+        readyText = "STEAL READY",
+        activeText = "STEALING",
+        windupTimeout = 2.0,
+    },
+}
+
+local COLORS = {
+    READY = Color3.fromRGB(255, 90, 90),
+    WINDUP = Color3.fromRGB(255, 215, 70),
+    ACTIVE = Color3.fromRGB(255, 80, 170),
+    COOLDOWN = Color3.fromRGB(100, 220, 255),
+}
+
+local environment = getgenv and getgenv() or _G
+
+if environment.__RARE_GRAB_BILLBOARDS
+    and environment.__RARE_GRAB_BILLBOARDS.Destroy then
+
+    pcall(function()
+        environment.__RARE_GRAB_BILLBOARDS:Destroy()
+    end)
+end
+
+local Controller = {
+    enabled = true,
+    destroyed = false,
+    connections = {},
+    trackers = setmetatable({}, { __mode = "k" }),
+}
+
+environment.__RARE_GRAB_BILLBOARDS = Controller
+S.rareBillboardController = Controller
+
+local pendingMonsters = setmetatable({}, { __mode = "k" })
+
+local function disconnectList(list)
+    for _, connection in ipairs(list) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    table.clear(list)
+end
+
+function Controller:Connect(signal, callback, list)
+    local connection = signal:Connect(callback)
+    table.insert(list or self.connections, connection)
+    return connection
+end
+
+local function normalizeAnimationId(animationId)
+    return tostring(animationId):match("%d+") or ""
+end
+
+local function lower(text)
+    return string.lower(tostring(text))
+end
+
+local function isInsideCurrentRoom(object)
+    local currentRoom = Workspace:FindFirstChild("CurrentRoom")
+
+    return currentRoom ~= nil
+        and object ~= nil
+        and object:IsDescendantOf(currentRoom)
+end
+
+local function isTargetMonster(object)
+    if not object
+        or not object:IsA("Model")
+        or not MONSTER_CONFIG[object.Name]
+        or not object.Parent
+        or object.Parent.Name ~= "Monsters" then
+
+        return false
+    end
+
+    return isInsideCurrentRoom(object)
+end
+
+local function findAnchor(monster, waitTime)
+    local anchor = monster:FindFirstChild("Head")
+        or monster:FindFirstChild("HumanoidRootPart")
+        or monster:FindFirstChildWhichIsA("BasePart", true)
+
+    if anchor then
+        return anchor
+    end
+
+    if waitTime and waitTime > 0 then
+        anchor = monster:WaitForChild("HumanoidRootPart", waitTime)
+
+        if anchor and anchor:IsA("BasePart") then
+            return anchor
+        end
+    end
+
+    return monster:FindFirstChild("Head")
+        or monster:FindFirstChild("HumanoidRootPart")
+        or monster:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function calculateOffset(monster, anchor)
+    if anchor and anchor.Name == "Head" then
+        return Vector3.new(0, 3.25, 0)
+    end
+
+    local success, size = pcall(function()
+        return monster:GetExtentsSize()
+    end)
+
+    if success then
+        return Vector3.new(0, math.max(4, size.Y * 0.5 + 1.75), 0)
+    end
+
+    return Vector3.new(0, 5, 0)
+end
+
+local function createBillboard(monster, config)
+    local old = monster:FindFirstChild(BILLBOARD_NAME, true)
+
+    if old then
+        old:Destroy()
+    end
+
+    local anchor = findAnchor(monster, 6)
+
+    if not anchor then
+        return nil
+    end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = BILLBOARD_NAME
+    billboard.Adornee = anchor
+    billboard.AlwaysOnTop = true
+    billboard.LightInfluence = 0
+    billboard.MaxDistance = 0
+    billboard.Size = UDim2.fromOffset(134, 43)
+    billboard.StudsOffsetWorldSpace = calculateOffset(monster, anchor)
+    billboard.Enabled = Controller.enabled
+    billboard.Parent = anchor
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Container"
+    frame.Size = UDim2.fromScale(1, 1)
+    frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+    frame.BackgroundTransparency = 0.16
+    frame.BorderSizePixel = 0
+    frame.Parent = billboard
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 5)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Name = "StateStroke"
+    stroke.Thickness = 1
+    stroke.Transparency = 0.1
+    stroke.Color = COLORS.READY
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Name = "MonsterName"
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(3, 2)
+    title.Size = UDim2.new(1, -6, 0, 15)
+    title.Font = Enum.Font.GothamBold
+    title.Text = config.displayName
+    title.TextColor3 = Color3.fromRGB(235, 235, 240)
+    title.TextSize = 10
+    title.TextStrokeTransparency = 0.7
+    title.Parent = frame
+
+    local state = Instance.new("TextLabel")
+    state.Name = "State"
+    state.BackgroundTransparency = 1
+    state.Position = UDim2.fromOffset(3, 14)
+    state.Size = UDim2.new(1, -6, 0, 24)
+    state.Font = Enum.Font.GothamBlack
+    state.Text = config.readyText
+    state.TextColor3 = COLORS.READY
+    state.TextSize = 13
+    state.TextStrokeColor3 = Color3.new(0, 0, 0)
+    state.TextStrokeTransparency = 0.35
+    state.Parent = frame
+
+    return {
+        gui = billboard,
+        frame = frame,
+        stroke = stroke,
+        title = title,
+        stateLabel = state,
+    }
+end
+
+local function applyVisual(tracker, text, color)
+    if not tracker.visual
+        or not tracker.visual.gui
+        or not tracker.visual.gui.Parent then
+
+        return
+    end
+
+    tracker.visual.stateLabel.Text = text
+    tracker.visual.stateLabel.TextColor3 = color
+    tracker.visual.stroke.Color = color
+end
+
+local function setState(tracker, newState)
+    if not tracker or tracker.destroyed then
+        return
+    end
+
+    tracker.state = newState
+
+    if newState == "READY" then
+        tracker.windupDeadline = nil
+        tracker.cooldownEndsAt = nil
+        applyVisual(tracker, tracker.config.readyText, COLORS.READY)
+
+    elseif newState == "WINDUP" then
+        tracker.windupDeadline = os.clock()
+            + (tracker.config.windupTimeout or 2.5)
+
+        applyVisual(tracker, "WINDUP", COLORS.WINDUP)
+
+    elseif newState == "ACTIVE" then
+        tracker.windupDeadline = nil
+        applyVisual(tracker, tracker.config.activeText, COLORS.ACTIVE)
+
+    elseif newState == "COOLDOWN" then
+        tracker.windupDeadline = nil
+
+        local remaining = math.max(
+            0,
+            (tracker.cooldownEndsAt or os.clock()) - os.clock()
+        )
+
+        applyVisual(
+            tracker,
+            string.format("%.1fs", remaining),
+            COLORS.COOLDOWN
+        )
+    end
+end
+
+local function startCooldown(tracker)
+    if not tracker or tracker.destroyed then
+        return
+    end
+
+    tracker.windupDeadline = nil
+    tracker.cooldownEndsAt = os.clock() + tracker.config.cooldown
+    setState(tracker, "COOLDOWN")
+end
+
+local function buildAnimationMap(monster)
+    local animationMap = {}
+
+    for _, object in ipairs(monster:GetDescendants()) do
+        if object:IsA("Animation") then
+            local id = normalizeAnimationId(object.AnimationId)
+            local name = lower(object.Name)
+
+            if id ~= "" then
+                if string.find(name, "windup", 1, true) then
+                    animationMap[id] = "WINDUP"
+                elseif name == "grab"
+                    or string.find(name, "rangedgrab", 1, true)
+                    or string.find(name, "steal", 1, true) then
+
+                    animationMap[id] = "WINDUP"
+                end
+            end
+        end
+    end
+
+    return animationMap
+end
+
+local function bindAnimator(tracker, animator)
+    if not animator
+        or not animator:IsA("Animator")
+        or tracker.boundAnimators[animator] then
+
+        return
+    end
+
+    tracker.boundAnimators[animator] = true
+
+    Controller:Connect(
+        animator.AnimationPlayed,
+        function(track)
+            if tracker.destroyed then
+                return
+            end
+
+            local animation = track.Animation
+            local animationId = animation
+                and normalizeAnimationId(animation.AnimationId)
+                or ""
+
+            local animationName = lower(
+                animation and animation.Name or track.Name
+            )
+
+            local classifiedState = tracker.animationMap[animationId]
+
+            if not classifiedState then
+                if string.find(animationName, "windup", 1, true)
+                    or animationName == "grab"
+                    or string.find(animationName, "rangedgrab", 1, true)
+                    or string.find(animationName, "steal", 1, true) then
+
+                    classifiedState = "WINDUP"
+                end
+            end
+
+            if classifiedState == "WINDUP"
+                and tracker.state ~= "ACTIVE" then
+
+                setState(tracker, "WINDUP")
+            end
+        end,
+        tracker.connections
+    )
+end
+
+local function cleanupTracker(tracker)
+    if not tracker or tracker.destroyed then
+        return
+    end
+
+    tracker.destroyed = true
+    disconnectList(tracker.connections)
+
+    if tracker.visual
+        and tracker.visual.gui
+        and tracker.visual.gui.Parent then
+
+        tracker.visual.gui:Destroy()
+    end
+
+    Controller.trackers[tracker.monster] = nil
+end
+
+local function trackMonster(monster)
+    if Controller.destroyed
+        or not isTargetMonster(monster)
+        or Controller.trackers[monster]
+        or pendingMonsters[monster] then
+
+        return
+    end
+
+    pendingMonsters[monster] = true
+
+    task.spawn(function()
+        if not monster.Parent or not isTargetMonster(monster) then
+            pendingMonsters[monster] = nil
+            return
+        end
+
+        local config = MONSTER_CONFIG[monster.Name]
+        local visual = createBillboard(monster, config)
+
+        if Controller.destroyed then
+            pendingMonsters[monster] = nil
+            if visual and visual.gui then
+                visual.gui:Destroy()
+            end
+            return
+        end
+
+        if not visual then
+            pendingMonsters[monster] = nil
+
+            if monster.Parent and isTargetMonster(monster) then
+                task.delay(1, function()
+                    trackMonster(monster)
+                end)
+            end
+
+            return
+        end
+
+        local tracker = {
+            monster = monster,
+            config = config,
+            visual = visual,
+            state = "READY",
+            cooldownEndsAt = nil,
+            windupDeadline = nil,
+            wasGrabbing = false,
+            destroyed = false,
+            connections = {},
+            boundAnimators = setmetatable({}, { __mode = "k" }),
+            animationMap = buildAnimationMap(monster),
+        }
+
+        Controller.trackers[monster] = tracker
+        pendingMonsters[monster] = nil
+
+        local grabbing = monster:FindFirstChild("Grabbing")
+            or monster:WaitForChild("Grabbing", 5)
+
+        if grabbing and grabbing:IsA("BoolValue") then
+            tracker.wasGrabbing = grabbing.Value
+
+            if grabbing.Value then
+                setState(tracker, "ACTIVE")
+            else
+                setState(tracker, "READY")
+            end
+
+            Controller:Connect(
+                grabbing:GetPropertyChangedSignal("Value"),
+                function()
+                    if tracker.destroyed then
+                        return
+                    end
+
+                    local isGrabbing = grabbing.Value
+
+                    if isGrabbing then
+                        tracker.windupDeadline = nil
+                        tracker.cooldownEndsAt = nil
+                        setState(tracker, "ACTIVE")
+                    elseif tracker.wasGrabbing then
+                        startCooldown(tracker)
+                    end
+
+                    tracker.wasGrabbing = isGrabbing
+                end,
+                tracker.connections
+            )
+        else
+            setState(tracker, "READY")
+        end
+
+        local chasing = monster:FindFirstChild("Chasing")
+
+        if chasing and chasing:IsA("BoolValue") then
+            Controller:Connect(
+                chasing:GetPropertyChangedSignal("Value"),
+                function()
+                    if tracker.destroyed then
+                        return
+                    end
+
+                    if not chasing.Value
+                        and tracker.state == "WINDUP"
+                        and not (grabbing and grabbing.Value) then
+
+                        startCooldown(tracker)
+                    end
+                end,
+                tracker.connections
+            )
+        end
+
+        local animator = monster:FindFirstChildWhichIsA("Animator", true)
+
+        if animator then
+            bindAnimator(tracker, animator)
+        end
+
+        Controller:Connect(
+            monster.DescendantAdded,
+            function(object)
+                if tracker.destroyed then
+                    return
+                end
+
+                if object:IsA("Animator") then
+                    bindAnimator(tracker, object)
+                end
+
+                if object:IsA("Animation") then
+                    local id = normalizeAnimationId(object.AnimationId)
+                    local name = lower(object.Name)
+
+                    if id ~= "" then
+                        if string.find(name, "windup", 1, true)
+                            or name == "grab"
+                            or string.find(name, "rangedgrab", 1, true)
+                            or string.find(name, "steal", 1, true) then
+
+                            tracker.animationMap[id] = "WINDUP"
+                        end
+                    end
+                end
+
+                local objectName = lower(object.Name)
+
+                if string.find(
+                    objectName,
+                    "rangedwindupsound",
+                    1,
+                    true
+                ) then
+                    if tracker.state ~= "ACTIVE" then
+                        setState(tracker, "WINDUP")
+                    end
+                end
+            end,
+            tracker.connections
+        )
+
+        Controller:Connect(
+            monster.AncestryChanged,
+            function()
+                if tracker.destroyed then
+                    return
+                end
+
+                if not monster.Parent
+                    or not isInsideCurrentRoom(monster) then
+
+                    cleanupTracker(tracker)
+                end
+            end,
+            tracker.connections
+        )
+
+    end)
+end
+
+function Controller:SetEnabled(enabled)
+    self.enabled = enabled
+
+    for _, tracker in pairs(self.trackers) do
+        if tracker.visual
+            and tracker.visual.gui
+            and tracker.visual.gui.Parent then
+
+            tracker.visual.gui.Enabled = enabled
+        end
+    end
+
+end
+
+function Controller:Destroy()
+    if self.destroyed then
+        return
+    end
+
+    self.destroyed = true
+
+    for _, tracker in pairs(self.trackers) do
+        cleanupTracker(tracker)
+    end
+
+    disconnectList(self.connections)
+
+    if environment.__RARE_GRAB_BILLBOARDS == self then
+        environment.__RARE_GRAB_BILLBOARDS = nil
+    end
+end
+
+
+local billboardBoundRooms = setmetatable({}, { __mode = "k" })
+local billboardBoundMonsterFolders = setmetatable({}, { __mode = "k" })
+local billboardBoundCurrentRooms = setmetatable({}, { __mode = "k" })
+
+local function scanBillboardMonsterFolder(monstersFolder)
+    if Controller.destroyed or not monstersFolder then
+        return
+    end
+
+    for _, monster in ipairs(monstersFolder:GetChildren()) do
+        if monster:IsA("Model")
+            and MONSTER_CONFIG[monster.Name] then
+
+            trackMonster(monster)
+        end
+    end
+end
+
+local function bindBillboardMonsterFolder(monstersFolder)
+    if Controller.destroyed
+        or not monstersFolder
+        or billboardBoundMonsterFolders[monstersFolder] then
+
+        return
+    end
+
+    billboardBoundMonsterFolders[monstersFolder] = true
+
+    Controller:Connect(
+        monstersFolder.ChildAdded,
+        function(monster)
+            if monster:IsA("Model")
+                and MONSTER_CONFIG[monster.Name] then
+
+                trackMonster(monster)
+            end
+        end
+    )
+
+    scanBillboardMonsterFolder(monstersFolder)
+
+    task.delay(0.75, function()
+        if monstersFolder.Parent then
+            scanBillboardMonsterFolder(monstersFolder)
+        end
+    end)
+
+    task.delay(2.0, function()
+        if monstersFolder.Parent then
+            scanBillboardMonsterFolder(monstersFolder)
+        end
+    end)
+end
+
+local function bindBillboardRoom(room)
+    if Controller.destroyed
+        or not room
+        or not room:IsA("Model")
+        or billboardBoundRooms[room] then
+
+        return
+    end
+
+    billboardBoundRooms[room] = true
+
+    Controller:Connect(
+        room.ChildAdded,
+        function(child)
+            if child.Name == "Monsters" then
+                bindBillboardMonsterFolder(child)
+            end
+        end
+    )
+
+    local monstersFolder = room:FindFirstChild("Monsters")
+
+    if monstersFolder then
+        bindBillboardMonsterFolder(monstersFolder)
+    end
+end
+
+local function bindCurrentRoomFolder(currentRoomFolder)
+    if Controller.destroyed
+        or not currentRoomFolder
+        or billboardBoundCurrentRooms[currentRoomFolder] then
+
+        return
+    end
+
+    billboardBoundCurrentRooms[currentRoomFolder] = true
+
+    Controller:Connect(
+        currentRoomFolder.ChildAdded,
+        function(room)
+            if room:IsA("Model") then
+                bindBillboardRoom(room)
+            end
+        end
+    )
+
+    for _, room in ipairs(currentRoomFolder:GetChildren()) do
+        if room:IsA("Model") then
+            bindBillboardRoom(room)
+        end
+    end
+end
+
+local billboardCurrentRoom = Workspace:FindFirstChild("CurrentRoom")
+
+if billboardCurrentRoom then
+    bindCurrentRoomFolder(billboardCurrentRoom)
+end
+
+Controller:Connect(
+    Workspace.ChildAdded,
+    function(child)
+        if child.Name == "CurrentRoom" then
+            bindCurrentRoomFolder(child)
+        end
+    end
+)
+
+local billboardUpdateAccumulator = 0
+
+Controller:Connect(
+    RunService.Heartbeat,
+    function(deltaTime)
+        if Controller.destroyed then
+            return
+        end
+
+        billboardUpdateAccumulator += deltaTime
+
+        if billboardUpdateAccumulator < 0.10 then
+            return
+        end
+
+        billboardUpdateAccumulator = 0
+
+        local now = os.clock()
+
+        for monster, tracker in pairs(Controller.trackers) do
+            if tracker.destroyed or not monster.Parent then
+                cleanupTracker(tracker)
+
+            elseif tracker.state == "WINDUP"
+                and tracker.windupDeadline
+                and now >= tracker.windupDeadline then
+
+                local grabbing = monster:FindFirstChild("Grabbing")
+
+                if grabbing
+                    and grabbing:IsA("BoolValue")
+                    and grabbing.Value then
+
+                    setState(tracker, "ACTIVE")
+                else
+                    startCooldown(tracker)
+                end
+
+            elseif tracker.state == "COOLDOWN" then
+                local remaining =
+                    (tracker.cooldownEndsAt or 0) - now
+
+                if remaining <= 0 then
+                    setState(tracker, "READY")
+                else
+                    applyVisual(
+                        tracker,
+                        string.format("%.1fs", remaining),
+                        COLORS.COOLDOWN
+                    )
+                end
+            end
+        end
+    end
+)
+end
+
+print("VICK ESP + Auto Skill Check + Billboard raros carregado")
+
+
+
+-- PAINEL UNIFICADO VICK | F6
+do
+    local RunService = game:GetService("RunService")
+    local Lighting = game:GetService("Lighting")
+    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local old = PlayerGui:FindFirstChild("__VICK_UNIFIED_PANEL")
+    if old then old:Destroy() end
+
+    local flags = {
+        GeneratorESP = enabled.GeneratorESP,
+        MonsterESP = enabled.MonsterESP,
+        PlayerESP = enabled.PlayerESP,
+        PlayerInfo = true,
+        ItemESP = enabled.ItemESP,
+        ItemTracer = false,
+        RareBillboard = true,
+        AutoSkill = S.skillEnabled,
+        FullBright = false,
+        FOV = false,
+    }
+    local camera = workspace.CurrentCamera
+    local initialFOV = camera and camera.FieldOfView or 70
+    local targetFOV = math.clamp(math.floor(initialFOV + 0.5), 40, 120)
+    local lightProperties = {"Brightness", "ClockTime", "FogEnd", "GlobalShadows", "Ambient"}
+    S.originalLighting = {}
+    for _, prop in ipairs(lightProperties) do S.originalLighting[prop] = Lighting[prop] end
+
+    local function applyLighting()
+        if flags.FullBright then
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 12
+            Lighting.FogEnd = 1000000
+            Lighting.GlobalShadows = false
+            Lighting.Ambient = Color3.fromRGB(190, 190, 190)
+        else
+            for prop, value in pairs(S.originalLighting) do Lighting[prop] = value end
+        end
+    end
+
+    local function applyFOV()
+        local cam = workspace.CurrentCamera
+        if cam and flags.FOV and math.abs(cam.FieldOfView - targetFOV) > 0.05 then
+            cam.FieldOfView = targetFOV
+        end
+    end
+
+    local function clearTracers()
+        for item, beam in pairs(S.tracers) do
+            if beam then
+                local target = beam.Parent
+                beam:Destroy()
+                if target and target.Name == "__VickTracerTarget" then target:Destroy() end
+            end
+            S.tracers[item] = nil
+        end
+        if S.tracerAttachment then S.tracerAttachment:Destroy() S.tracerAttachment = nil end
+    end
+
+    local function updateTracers()
+        if not flags.ItemTracer then
+            if next(S.tracers) then clearTracers() end
+            return
+        end
+        local root = getRoot(LocalPlayer.Character)
+        if not root then clearTracers() return end
+        if not S.tracerAttachment or S.tracerAttachment.Parent ~= root then
+            clearTracers()
+            S.tracerAttachment = Instance.new("Attachment")
+            S.tracerAttachment.Name = "__VickTracerOrigin"
+            S.tracerAttachment.Parent = root
+        end
+        local seen = {}
+        for highlight in pairs(tracked.ItemESP) do
+            if highlight and highlight.Parent then
+                local item = highlight.Adornee
+                local part = item and (item:IsA("BasePart") and item
+                    or item:IsA("Model") and (item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart", true)))
+                if part and part.Parent and item:IsDescendantOf(CurrentRoom) then
+                    seen[item] = true
+                    if not S.tracers[item] then
+                        local target = Instance.new("Attachment")
+                        target.Name = "__VickTracerTarget"
+                        target.Parent = part
+                        local beam = Instance.new("Beam")
+                        beam.Name = "__VickItemTracer"
+                        beam.Attachment0 = S.tracerAttachment
+                        beam.Attachment1 = target
+                        beam.FaceCamera = true
+                        beam.Width0 = 0.055
+                        beam.Width1 = 0.055
+                        beam.Transparency = NumberSequence.new(0.12)
+                        beam.Color = ColorSequence.new(colors.ItemESP)
+                        beam.LightEmission = 1
+                        beam.Parent = target
+                        S.tracers[item] = beam
+                    end
+                end
+            end
+        end
+        for item, beam in pairs(S.tracers) do
+            if not seen[item] or not beam.Parent then
+                local attachment = beam.Parent
+                beam:Destroy()
+                if attachment and attachment.Name == "__VickTracerTarget" then attachment:Destroy() end
+                S.tracers[item] = nil
+            end
+        end
+    end
+
+    local function setFlag(key, value)
+        flags[key] = value
+        if enabled[key] ~= nil then
+            if enabled[key] ~= value then toggleESP(key) end
+        elseif key == "PlayerInfo" then
+            S.playerInfoEnabled = value
+            for bill in pairs(S.billboards) do
+                if bill.Parent then bill.Enabled = enabled.PlayerESP and value end
+            end
+        elseif key == "RareBillboard" then
+            if S.rareBillboardController and not S.rareBillboardController.destroyed then
+                S.rareBillboardController:SetEnabled(value)
+            end
+        elseif key == "AutoSkill" then
+            setSkillEnabled(value)
+        elseif key == "FullBright" then
+            applyLighting()
+        elseif key == "FOV" then
+            if value then applyFOV()
+            elseif workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView = initialFOV end
+        elseif key == "ItemTracer" and not value then
+            clearTracers()
+        end
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "__VICK_UNIFIED_PANEL"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = false
+    gui.DisplayOrder = 150
+    gui.Parent = PlayerGui
+    S.gui = gui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.Size = UDim2.fromOffset(330, 490)
+    panel.Position = UDim2.new(1, -350, 0.14, 0)
+    panel.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
+    panel.BorderSizePixel = 0
+    panel.Active = true
+    panel.Parent = gui
+    local corner = Instance.new("UICorner", panel)
+    corner.CornerRadius = UDim.new(0, 12)
+    local outline = Instance.new("UIStroke", panel)
+    outline.Color = Color3.fromRGB(68, 82, 103)
+    outline.Thickness = 1
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 46)
+    header.BackgroundTransparency = 1
+    header.Active = true
+    header.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -65, 1, 0)
+    title.Position = UDim2.fromOffset(15, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "VICK  |  CONTROLES"
+    title.TextColor3 = Color3.fromRGB(241, 245, 252)
+    title.TextSize = 15
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = header
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.fromOffset(29, 29)
+    close.Position = UDim2.new(1, -39, 0, 8)
+    close.BackgroundColor3 = Color3.fromRGB(46, 52, 65)
+    close.Text = "X"
+    close.TextColor3 = Color3.new(1, 1, 1)
+    close.TextSize = 13
+    close.Font = Enum.Font.GothamBold
+    close.Parent = header
+    Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
+    connect(close.MouseButton1Click, function() gui.Enabled = false end)
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Position = UDim2.fromOffset(12, 49)
+    scroll.Size = UDim2.new(1, -24, 1, -76)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(95, 115, 148)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.CanvasSize = UDim2.fromOffset(0, 0)
+    scroll.Parent = panel
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 7)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = scroll
+
+    local function textLabel(text, height)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -5, 0, height)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(145, 165, 191)
+        label.TextSize = 11
+        label.Font = Enum.Font.GothamBold
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = scroll
+        return label
+    end
+
+    local function makeToggle(labelText, key)
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -6, 0, 35)
+        row.BackgroundColor3 = Color3.fromRGB(32, 37, 49)
+        row.BorderSizePixel = 0
+        row.Parent = scroll
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -92, 1, 0)
+        label.Position = UDim2.fromOffset(11, 0)
+        label.BackgroundTransparency = 1
+        label.Text = labelText
+        label.TextColor3 = Color3.fromRGB(231, 237, 247)
+        label.TextSize = 12
+        label.Font = Enum.Font.GothamMedium
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = row
+
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.fromOffset(65, 25)
+        button.Position = UDim2.new(1, -72, 0.5, -12)
+        button.TextSize = 11
+        button.Font = Enum.Font.GothamBold
+        button.TextColor3 = Color3.new(1, 1, 1)
+        button.Parent = row
+        Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
+        local function paint()
+            button.Text = flags[key] and "ON" or "OFF"
+            button.BackgroundColor3 = flags[key]
+                and Color3.fromRGB(34, 143, 100) or Color3.fromRGB(118, 57, 68)
+        end
+        paint()
+        connect(button.MouseButton1Click, function()
+            setFlag(key, not flags[key])
+            paint()
+        end)
+    end
+
+    textLabel("ESP", 19)
+    makeToggle("Geradores (azul)", "GeneratorESP")
+    makeToggle("Twisteds (vermelho)", "MonsterESP")
+    makeToggle("Jogadores (verde)", "PlayerESP")
+    makeToggle("Info jogadores / HP", "PlayerInfo")
+    makeToggle("Itens (amarelo)", "ItemESP")
+    makeToggle("Tracer dos itens", "ItemTracer")
+    textLabel("EXTRAS", 19)
+    makeToggle("Billboard Scraps / Goob / Gigi", "RareBillboard")
+    makeToggle("Auto Skill Check", "AutoSkill")
+    makeToggle("FullBright", "FullBright")
+    makeToggle("FOV personalizado", "FOV")
+
+    textLabel("FOV  |  40 a 120", 20)
+    local fovRow = Instance.new("Frame")
+    fovRow.Size = UDim2.new(1, -6, 0, 38)
+    fovRow.BackgroundColor3 = Color3.fromRGB(32, 37, 49)
+    fovRow.BorderSizePixel = 0
+    fovRow.Parent = scroll
+    Instance.new("UICorner", fovRow).CornerRadius = UDim.new(0, 7)
+
+    local function fovButton(txt, x, w)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(w, 28)
+        b.Position = UDim2.fromOffset(x, 5)
+        b.BackgroundColor3 = Color3.fromRGB(51, 63, 82)
+        b.Text = txt
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 13
+        b.Parent = fovRow
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        return b
+    end
+    local minus = fovButton("-", 8, 34)
+    local plus = fovButton("+", 222, 34)
+    local reset = fovButton("R", 261, 30)
+    local valueBox = Instance.new("TextBox")
+    valueBox.Size = UDim2.fromOffset(164, 28)
+    valueBox.Position = UDim2.fromOffset(49, 5)
+    valueBox.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
+    valueBox.TextColor3 = Color3.new(1, 1, 1)
+    valueBox.Font = Enum.Font.GothamBold
+    valueBox.TextSize = 14
+    valueBox.Text = tostring(targetFOV)
+    valueBox.ClearTextOnFocus = false
+    valueBox.Parent = fovRow
+    Instance.new("UICorner", valueBox).CornerRadius = UDim.new(0, 5)
+
+    local function setFov(v)
+        local n = tonumber(v)
+        if n then targetFOV = math.clamp(math.floor(n + 0.5), 40, 120) end
+        valueBox.Text = tostring(targetFOV)
+        applyFOV()
+    end
+    connect(minus.MouseButton1Click, function() setFov(targetFOV - 5) end)
+    connect(plus.MouseButton1Click, function() setFov(targetFOV + 5) end)
+    connect(reset.MouseButton1Click, function() setFov(initialFOV) end)
+    connect(valueBox.FocusLost, function() setFov(valueBox.Text) end)
+
+    local hint = Instance.new("TextLabel")
+    hint.Position = UDim2.new(0, 14, 1, -24)
+    hint.Size = UDim2.new(1, -28, 0, 18)
+    hint.BackgroundTransparency = 1
+    hint.Text = "F6: mostrar / esconder  •  arraste pelo titulo"
+    hint.TextColor3 = Color3.fromRGB(147, 159, 179)
+    hint.Font = Enum.Font.Gotham
+    hint.TextSize = 10
+    hint.Parent = panel
+
+    local dragging, dragStart, panelStart, dragInput = false, nil, nil, nil
+    connect(header.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragInput = input
+            dragStart = input.Position
+            panelStart = panel.Position
+        end
+    end)
+    connect(UIS.InputChanged, function(input)
+        if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X,
+                panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
+        end
+    end)
+    connect(UIS.InputEnded, function(input)
+        if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    connect(UIS.InputBegan, function(input, processed)
+        if not processed and input.KeyCode == Enum.KeyCode.F6 then
+            gui.Enabled = not gui.Enabled
+        end
+    end)
+
+    local accumulator = 0
+    connect(RunService.Heartbeat, function(dt)
+        if S.destroyed then return end
+        accumulator += dt
+        if accumulator < 0.15 then return end
+        accumulator = 0
+        updateTracers()
+        applyFOV()
+        if flags.FullBright then applyLighting() end
+    end)
+end
+print("[VICK] Painel unificado carregado | F6 abre/fecha")
