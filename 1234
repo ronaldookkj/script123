@@ -1,1849 +1,1071 @@
+--[[
+    DW | Painel F6 - versão leve / inicialização sob demanda
+    Base funcional reescrita a partir das funções do arquivo 1234.
+    TODOS OS RECURSOS DE JOGO COMEÇAM OFF.
+    Vee e Ichor: SOMENTE filtro visual ligado ao iniciar.
+
+    Não executar junto com a versão antiga. Reinicie o Roblox antes de substituir.
+    Este script é experimental, não foi testado em uma partida / Xeno.
+]]
+
+if not game:IsLoaded() then game.Loaded:Wait() end
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local LocalPlayer = Players.LocalPlayer
-local CurrentRoom = workspace:WaitForChild("CurrentRoom")
+local RS = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local WS = game:GetService("Workspace")
+local LP = Players.LocalPlayer
+if not LP then warn("[DW] LocalPlayer indisponível") return end
+local PG = LP:WaitForChild("PlayerGui", 12)
+if not PG then warn("[DW] PlayerGui indisponível") return end
 
-local env = getgenv and getgenv() or _G
-local KEY = "__ESP_4_CORES"
-
-if env[KEY] and type(env[KEY].Destroy) == "function" then
-    pcall(function()
-        env[KEY]:Destroy()
-    end)
+local env = (type(getgenv) == "function" and getgenv()) or _G
+local KEY = "__DW_F6_LEVE_V1"
+if env[KEY] and not env[KEY].destroyed then
+    warn("[DW] O painel leve já está ativo! Não vou duplicar conexões.")
+    return
+end
+if env.__ESP_4_CORES and not env.__ESP_4_CORES.destroyed then
+    warn("[DW] Versão antiga ativa nesta sessão. Reinicie o Roblox para não sobrepor scripts.")
+    return
 end
 
-local S = {
-    destroyed = false,
-    connections = {},
-    highlights = {},
-    billboards = {},
-    rareBillboardController = nil,
-    skillRemote = nil,
-    originalSkillCallback = nil,
-    skillEnabled = true,
-    playerInfoEnabled = true,
-    tracers = {},
-    tracerAttachment = nil,
-    gui = nil,
-    originalLighting = nil,
-    staminaController = nil,
-    restoreFOV = nil
-}
-
+local S = { destroyed = false, connections = {}, roomConns = {}, playerConns = {},
+    staminaConns = {}, visuals = {}, worldObjects = {},
+    playerObjects = {}, grabbers = {}, tracers = {}, skillRemote = nil,
+    skillOriginal = nil, skillCallback = nil, ui = nil }
 env[KEY] = S
 
+local flags = {
+    GeneratorESP = false, MonsterESP = false, PlayerESP = false,
+    PlayerInfo = false, ItemESP = false, ItemTracer = false,
+    RareBillboard = false, AutoSkill = false, InfiniteStamina = false,
+    FullBright = false, FOV = false,
+    HideVee = true, HideIchor = true,
+}
 local colors = {
     GeneratorESP = Color3.fromRGB(0, 170, 255),
     MonsterESP = Color3.fromRGB(255, 45, 45),
     PlayerESP = Color3.fromRGB(0, 255, 90),
-    ItemESP = Color3.fromRGB(255, 225, 0)
+    ItemESP = Color3.fromRGB(255, 225, 0),
 }
 
-local enabled = {
-    GeneratorESP = true,
-    MonsterESP = true,
-    PlayerESP = true,
-    ItemESP = true
-}
-
-local tracked = {
-    GeneratorESP = setmetatable({}, {__mode = "k"}),
-    MonsterESP = setmetatable({}, {__mode = "k"}),
-    PlayerESP = setmetatable({}, {__mode = "k"}),
-    ItemESP = setmetatable({}, {__mode = "k"})
-}
-
-local boundRooms = setmetatable({}, {__mode = "k"})
-local boundFolders = setmetatable({}, {__mode = "k"})
-local boundGenerators = setmetatable({}, {__mode = "k"})
-local boundBlots = setmetatable({}, {__mode = "k"})
-local boundPlayers = setmetatable({}, {__mode = "k"})
-
-local function connect(signal, callback)
-    if S.destroyed then return nil end
-    local connection = signal:Connect(callback)
-    table.insert(S.connections, connection)
-    return connection
+local function conn(signal, fn, bucket)
+    if S.destroyed or not signal then return nil end
+    local ok, c = pcall(function() return signal:Connect(fn) end)
+    if ok and c then table.insert(bucket or S.connections, c) return c end
+    return nil
 end
-
-local function createHighlight(item, name, transparency)
-    if S.destroyed or not item or not item.Parent then return nil end
-
-    local highlightName = name == "PlayerESP"
-        and "__DistrairPlayerHighlight" or name
-
-    local h = item:FindFirstChild(highlightName)
-    if not h or not h:IsA("Highlight") then
-        h = Instance.new("Highlight")
-        h.Name = highlightName
-        h.Parent = item
+local function disconnect(bucket)
+    for i = #bucket, 1, -1 do
+        pcall(function() bucket[i]:Disconnect() end)
+        bucket[i] = nil
     end
-
-    h.Adornee = item
-    h.FillColor = colors[name]
-    h.OutlineColor = colors[name]
-    h.FillTransparency = transparency
-    h.OutlineTransparency = 0
-    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    h.Enabled = enabled[name]
-    tracked[name][h] = true
-    S.highlights[h] = true
-    return h
+end
+local function safeDestroy(obj)
+    if obj then pcall(function() obj:Destroy() end) end
+end
+local function root(char)
+    return char and (char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or char.PrimaryPart)
 end
 
-local function addGenerator(item)
-    if S.destroyed or not item or boundGenerators[item] then return end
-    boundGenerators[item] = true
+-- ============================================================
+-- FILTRO VISUAL VEE + ICHOR: UMA varredura limitada + eventos.
+-- Não fica procurando na tela por segundo/frame.
+-- Ao mudar nome da UI em atualizações, ampliar os nomes abaixo.
+-- ============================================================
+local EXTRA_VEE_NAMES = {
+    veepopup = true, vee_popup = true, veead = true, vee_ad = true,
+    veeadvertisement = true, veeadvert = true,
+}
+local EXTRA_ICHOR_NAMES = {
+    ichorstain = true, ichorstains = true, ichorsplash = true,
+    ichorsplatter = true, ichoroverlay = true, ichorscreen = true,
+    ichorleakoverlay = true, ichorleakscreen = true, inksplash = true,
+}
+local watchGui = setmetatable({}, { __mode = "k" })
+local function compact(s)
+    return tostring(s or ""):lower():gsub("[%s%-%_]", "")
+end
+local function visualType(object)
+    if not object:IsA("GuiObject") and not object:IsA("LayerCollector") then return nil end
+    local name = compact(object.Name)
+    if EXTRA_VEE_NAMES[name] or (name:find("vee", 1, true)
+        and (name:find("popup", 1, true) or name:find("advert", 1, true)
+        or name:find("adwindow", 1, true))) then return "HideVee" end
+    if EXTRA_ICHOR_NAMES[name] or (name:find("ichor", 1, true)
+        and (name:find("stain", 1, true) or name:find("splash", 1, true)
+        or name:find("overlay", 1, true) or name:find("screen", 1, true))) then
+        return "HideIchor"
+    end
+    -- Identifica popups chamados apenas 'Popup' quando estão no contêiner da Vee.
+    if name == "popup" or name == "popupframe" or name == "advertisement" then
+        local ancestor = object.Parent
+        for _ = 1, 5 do
+            if not ancestor or ancestor == PG then break end
+            if compact(ancestor.Name):find("vee", 1, true) then return "HideVee" end
+            ancestor = ancestor.Parent
+        end
+    end
+    return nil
+end
+local function hideGui(obj, flag)
+    if S.destroyed or not flags[flag] or not obj or not obj.Parent then return end
+    pcall(function()
+        if obj:IsA("GuiObject") then
+            if obj.Visible then obj.Visible = false end
+        elseif obj:IsA("LayerCollector") then
+            if obj.Enabled then obj.Enabled = false end
+        end
+    end)
+end
+local function watchVisual(obj)
+    if S.destroyed or not obj or watchGui[obj] then return end
+    local flag = visualType(obj)
+    if not flag then return end
+    local bucket = {}
+    watchGui[obj] = { flag = flag, conns = bucket }
+    hideGui(obj, flag)
+    local property = obj:IsA("GuiObject") and "Visible" or "Enabled"
+    conn(obj:GetPropertyChangedSignal(property), function()
+        hideGui(obj, flag)
+    end, bucket)
+    conn(obj.AncestryChanged, function(_, parent)
+        if not parent and watchGui[obj] then
+            disconnect(watchGui[obj].conns)
+            watchGui[obj] = nil
+        end
+    end, bucket)
+end
+-- O loop abaixo ocorre APENAS UMA VEZ na inicialização, com teto de trabalho.
+local scanList = { PG }
+local scanIndex = 1
+while scanIndex <= #scanList and scanIndex <= 800 do
+    local parent = scanList[scanIndex]
+    scanIndex += 1
+    for _, obj in ipairs(parent:GetChildren()) do
+        watchVisual(obj)
+        if #scanList < 800 then table.insert(scanList, obj) end
+    end
+end
+scanList = nil
+conn(PG.DescendantAdded, watchVisual)
 
-    local stats = item:FindFirstChild("Stats")
-    local completed = stats and stats:FindFirstChild("Completed")
-    if completed and completed.Value == true then return end
+-- ============================================================
+-- ESP DE MUNDO (só conecta a salas quando algum recurso é ON)
+-- ============================================================
+local function worldNeeded()
+    return flags.GeneratorESP or flags.MonsterESP or flags.ItemESP
+        or flags.ItemTracer or flags.RareBillboard
+end
+local function getCurrentRoom()
+    return WS:FindFirstChild("CurrentRoom")
+end
+local function newHighlight(obj, kind, alpha)
+    if S.destroyed or not obj or not obj.Parent or not flags[kind] then return end
+    if not (obj:IsA("Model") or obj:IsA("BasePart")) then
+        obj = obj:FindFirstChildWhichIsA("Model", true) or obj:FindFirstChildWhichIsA("BasePart", true)
+    end
+    if not obj then return end
+    local id = "__DWLeve" .. kind
+    local h = obj:FindFirstChild(id)
+    if not h then
+        h = Instance.new("Highlight")
+        h.Name = id
+        h.Adornee = obj
+        h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.FillTransparency = alpha
+        h.OutlineTransparency = 0
+        h.FillColor = colors[kind]
+        h.OutlineColor = colors[kind]
+        h.Parent = obj
+    end
+    S.worldObjects[h] = true
+end
+local function removeWorldVisuals()
+    for h in pairs(S.worldObjects) do safeDestroy(h) S.worldObjects[h] = nil end
+end
+local function clearTracers()
+    for item, entry in pairs(S.tracers) do
+        safeDestroy(entry.beam)
+        safeDestroy(entry.target)
+        S.tracers[item] = nil
+    end
+    if S.tracerOrigin then safeDestroy(S.tracerOrigin) S.tracerOrigin = nil end
+end
+local function attachTracer(item)
+    if not flags.ItemTracer or not item or not item.Parent or S.tracers[item] then return end
+    local myRoot = root(LP.Character)
+    if not myRoot then return end
+    local part = item:IsA("BasePart") and item
+        or (item:IsA("Model") and (item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart", true)))
+        or item:FindFirstChildWhichIsA("BasePart", true)
+    if not part then return end
+    if not S.tracerOrigin or S.tracerOrigin.Parent ~= myRoot then
+        clearTracers()
+        S.tracerOrigin = Instance.new("Attachment")
+        S.tracerOrigin.Name = "__DWLeveOrigin"
+        S.tracerOrigin.Parent = myRoot
+    end
+    local target = Instance.new("Attachment")
+    target.Name = "__DWLeveTracerTarget"
+    target.Parent = part
+    local beam = Instance.new("Beam")
+    beam.Name = "__DWLeveTracer"
+    beam.Attachment0 = S.tracerOrigin
+    beam.Attachment1 = target
+    beam.FaceCamera = true
+    beam.Width0, beam.Width1 = 0.055, 0.055
+    beam.Transparency = NumberSequence.new(0.12)
+    beam.Color = ColorSequence.new(colors.ItemESP)
+    beam.LightEmission = 1
+    beam.Parent = target
+    S.tracers[item] = { beam = beam, target = target }
+end
 
-    local h = createHighlight(item, "GeneratorESP", 0.68)
+-- ============================================================
+-- GRABBER: só rastreia se o botão estiver ligado
+-- ============================================================
+local GRABBERS = {
+    ScrapsMonster = { "SCRAPS", 12 },
+    GoobMonster = { "GOOB", 10 },
+    GigiMonster = { "GIGI", 10 },
+}
+local function clearGrabbers()
+    for monster, t in pairs(S.grabbers) do
+        t.dead = true
+        disconnect(t.conns)
+        safeDestroy(t.gui)
+        S.grabbers[monster] = nil
+    end
+end
+local function trackGrabber(monster)
+    if not flags.RareBillboard or not monster:IsA("Model") or S.grabbers[monster] then return end
+    local config = GRABBERS[monster.Name]
+    if not config then return end
+    local anchor = monster:FindFirstChild("Head", true)
+        or monster:FindFirstChild("HumanoidRootPart", true)
+        or monster:FindFirstChildWhichIsA("BasePart", true)
+    if not anchor then return end
+    local g = Instance.new("BillboardGui")
+    g.Name = "__DWLeveGrabber"
+    g.Adornee = anchor
+    g.AlwaysOnTop = true
+    g.Size = UDim2.fromOffset(140, 44)
+    g.StudsOffsetWorldSpace = Vector3.new(0, 4.5, 0)
+    g.Parent = anchor
+    local f = Instance.new("Frame")
+    f.Size = UDim2.fromScale(1, 1)
+    f.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+    f.BackgroundTransparency = .12
+    f.Parent = g
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 6)
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 0, 17)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = config[1]
+    nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 11
+    nameLabel.Parent = f
+    local status = Instance.new("TextLabel")
+    status.Position = UDim2.fromOffset(0, 17)
+    status.Size = UDim2.new(1, 0, 0, 24)
+    status.BackgroundTransparency = 1
+    status.TextColor3 = Color3.fromRGB(140, 235, 150)
+    status.Font = Enum.Font.GothamBold
+    status.TextSize = 13
+    status.Text = "GRAB READY"
+    status.Parent = f
+    local t = { gui = g, status = status, conns = {}, dead = false, seq = 0 }
+    S.grabbers[monster] = t
+    local function setState(textValue, color)
+        if t.dead or not status.Parent then return end
+        status.Text = textValue
+        status.TextColor3 = color
+    end
+    local grabbing = monster:FindFirstChild("Grabbing", true)
+    if grabbing and grabbing:IsA("BoolValue") then
+        local wasActive = grabbing.Value
+        if wasActive then setState("GRABBING", Color3.fromRGB(215, 150, 255)) end
+        conn(grabbing:GetPropertyChangedSignal("Value"), function()
+            if t.dead then return end
+            if grabbing.Value then
+                wasActive = true
+                t.seq += 1
+                setState("GRABBING", Color3.fromRGB(215, 150, 255))
+            elseif wasActive then
+                wasActive = false
+                t.seq += 1
+                local id = t.seq
+                local untilTime = os.clock() + config[2]
+                task.spawn(function()
+                    while not t.dead and flags.RareBillboard and t.seq == id and os.clock() < untilTime do
+                        setState(string.format("%.1fs", math.max(0, untilTime - os.clock())), Color3.fromRGB(130, 195, 255))
+                        task.wait(0.2)
+                    end
+                    if not t.dead and t.seq == id then
+                        setState("GRAB READY", Color3.fromRGB(140, 235, 150))
+                    end
+                end)
+            end
+        end, t.conns)
+    end
+    conn(monster.AncestryChanged, function(_, parent)
+        if not parent then
+            t.dead = true
+            disconnect(t.conns)
+            safeDestroy(g)
+            S.grabbers[monster] = nil
+        end
+    end, t.conns)
+end
 
-    if completed then
-        connect(completed:GetPropertyChangedSignal("Value"), function()
-            if completed.Value == true and h and h.Parent then
-                tracked.GeneratorESP[h] = nil
-                h:Destroy()
+local function onRoomItem(item)
+    if S.destroyed or not item or not item.Parent then return end
+    local pn = item.Parent.Name
+    if pn == "Monsters" and item:IsA("Model") then
+        if flags.MonsterESP then newHighlight(item, "MonsterESP", 0.68) end
+        if flags.RareBillboard then trackGrabber(item) end
+    elseif pn == "Items" and not item.Name:find("Capsule") then
+        if flags.ItemESP then newHighlight(item, "ItemESP", 0.25) end
+        attachTracer(item)
+    elseif pn == "Generators" or item.Name == "Generator" then
+        if not flags.GeneratorESP then return end
+        local stats = item:FindFirstChild("Stats")
+        local complete = stats and stats:FindFirstChild("Completed")
+        if complete and complete.Value then return end
+        newHighlight(item, "GeneratorESP", 0.68)
+        if complete then
+            conn(complete:GetPropertyChangedSignal("Value"), function()
+                if complete.Value then
+                    local h = item:FindFirstChild("__DWLeveGeneratorESP")
+                    if h then
+                        safeDestroy(h)
+                        S.worldObjects[h] = nil
+                    end
+                end
+            end, S.roomConns)
+        end
+    end
+end
+local function bindRoomFolder(folder)
+    if folder.Name ~= "Generators" and folder.Name ~= "Monsters" and folder.Name ~= "Items" then return end
+    conn(folder.ChildAdded, onRoomItem, S.roomConns)
+    for _, item in ipairs(folder:GetChildren()) do onRoomItem(item) end
+end
+local function bindBlotZone(obj)
+    if not flags.MonsterESP or not obj:IsA("BasePart")
+        or not obj.Name:find("BlotHandZone", 1, true) then return end
+    local function addHand(hand)
+        if not hand:IsA("Model") then return end
+        task.spawn(function()
+            local arm = hand:FindFirstChild("Arm") or hand:WaitForChild("Arm", 4)
+            if arm and flags.MonsterESP and not S.destroyed then
+                newHighlight(arm, "MonsterESP", 0.68)
             end
         end)
     end
+    conn(obj.ChildAdded, addHand, S.roomConns)
+    for _, hand in ipairs(obj:GetChildren()) do addHand(hand) end
 end
-
-local function onAdded(item)
-    if S.destroyed or not item or not item.Parent then return end
-    local parentName = item.Parent.Name
-
-    if parentName == "Generators" or item.Name == "Generator" then
-        addGenerator(item)
-    elseif parentName == "Items" then
-        if not item.Name:find("Capsule") then
-            createHighlight(item, "ItemESP", 0.25)
-        end
-    elseif parentName == "Monsters" then
-        createHighlight(item, "MonsterESP", 0.68)
-    end
-end
-
-local function highlightBlotHand(hand)
-    task.spawn(function()
-        local arm = hand:WaitForChild("Arm", 5)
-        if arm and not S.destroyed then
-            createHighlight(arm, "MonsterESP", 0.68)
-        end
-    end)
-end
-
-local function bindBlot(entity)
-    if not entity:IsA("Part")
-        or not entity.Name:find("BlotHandZone")
-        or boundBlots[entity] then return end
-
-    boundBlots[entity] = true
-    connect(entity.ChildAdded, function(child)
-        if child:IsA("Model") then
-            highlightBlotHand(child)
-        end
-    end)
-
-    for _, child in ipairs(entity:GetChildren()) do
-        if child:IsA("Model") then
-            highlightBlotHand(child)
-        end
-    end
-end
-
-local function bindFolder(folder)
-    if boundFolders[folder] then return end
-    boundFolders[folder] = true
-    connect(folder.ChildAdded, onAdded)
-    for _, item in ipairs(folder:GetChildren()) do
-        onAdded(item)
-    end
-end
-
-local function bindRoomChild(child)
-    if child.Name == "Monsters"
-        or child.Name == "Generators"
-        or child.Name == "Items" then
-        bindFolder(child)
-    end
-    if child.Name == "Generator" then
-        onAdded(child)
-    end
-    bindBlot(child)
-end
-
 local function bindRoom(room)
-    if not room:IsA("Model") or boundRooms[room] then return end
-    boundRooms[room] = true
-    connect(room.ChildAdded, bindRoomChild)
-    for _, child in ipairs(room:GetChildren()) do
-        bindRoomChild(child)
-    end
-end
-
-local function getRoot(char)
-    return char and (
-        char:FindFirstChild("HumanoidRootPart")
-        or char:FindFirstChild("UpperTorso")
-        or char:FindFirstChild("Torso")
-        or char.PrimaryPart
-    )
-end
-
-local function createPlayerBillboard(player, root)
-    local name = "__DistrairPlayerBillboard"
-    local bill = root:FindFirstChild(name)
-    if not bill or not bill:IsA("BillboardGui") then
-        bill = Instance.new("BillboardGui")
-        bill.Name = name
-        bill.Parent = root
-    end
-
-    bill.Adornee = root
-    bill.AlwaysOnTop = true
-    bill.LightInfluence = 0
-    bill.MaxDistance = 0
-    bill.Size = UDim2.fromOffset(155, 44)
-    bill.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
-    bill.Enabled = enabled.PlayerESP and S.playerInfoEnabled
-
-    local holder = bill:FindFirstChild("Holder")
-    if not holder then
-        holder = Instance.new("Frame")
-        holder.Name = "Holder"
-        holder.Parent = bill
-    end
-
-    holder.Size = UDim2.fromScale(1, 1)
-    holder.BackgroundColor3 = Color3.fromRGB(12, 12, 14)
-    holder.BackgroundTransparency = 0.35
-    holder.BorderSizePixel = 0
-
-    if not holder:FindFirstChildOfClass("UICorner") then
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 5)
-        corner.Parent = holder
-    end
-
-    local stroke = holder:FindFirstChildOfClass("UIStroke")
-    if not stroke then
-        stroke = Instance.new("UIStroke")
-        stroke.Parent = holder
-    end
-    stroke.Color = colors.PlayerESP
-    stroke.Thickness = 1
-    stroke.Transparency = 0.15
-
-    local function label(labelName, y, height, size, font)
-        local obj = holder:FindFirstChild(labelName)
-        if not obj or not obj:IsA("TextLabel") then
-            obj = Instance.new("TextLabel")
-            obj.Name = labelName
-            obj.Parent = holder
-        end
-        obj.BackgroundTransparency = 1
-        obj.Position = UDim2.fromOffset(3, y)
-        obj.Size = UDim2.new(1, -6, 0, height)
-        obj.Font = font
-        obj.TextSize = size
-        obj.TextStrokeTransparency = 0.45
-        return obj
-    end
-
-    local nameLabel = label("Name", 1, 20, 12, Enum.Font.GothamBold)
-    nameLabel.TextColor3 = colors.PlayerESP
-    nameLabel.Text = player.DisplayName ~= player.Name
-        and (player.DisplayName .. " @" .. player.Name)
-        or player.Name
-
-    local info = label("Info", 20, 18, 10, Enum.Font.Gotham)
-    info.TextColor3 = Color3.fromRGB(245, 245, 245)
-    S.billboards[bill] = true
-    return info
-end
-
-local function updatePlayer(player)
-    if S.destroyed or player == LocalPlayer then return end
-    local char = player.Character
-    local root = getRoot(char)
-    if not char or not root then return end
-
-    createHighlight(char, "PlayerESP", 0.78)
-    local info = createPlayerBillboard(player, root)
-    local myRoot = getRoot(LocalPlayer.Character)
-    local hum = char:FindFirstChildOfClass("Humanoid")
-
-    if info and myRoot then
-        local distance = math.floor((root.Position - myRoot.Position).Magnitude + 0.5)
-        local hp = hum and math.floor(hum.Health + 0.5) or 0
-        info.Text = tostring(distance) .. "m | HP " .. tostring(hp)
-    end
-end
-
-local function bindPlayer(player)
-    if player == LocalPlayer or boundPlayers[player] then return end
-    boundPlayers[player] = true
-    connect(player.CharacterAdded, function()
-        task.wait(0.35)
-        if not S.destroyed then updatePlayer(player) end
-    end)
-    updatePlayer(player)
-end
-
-local function toggleESP(name)
-    enabled[name] = not enabled[name]
-    for h in pairs(tracked[name]) do
-        if h and h.Parent then
-            h.Enabled = enabled[name]
-            h.FillColor = colors[name]
-            h.OutlineColor = colors[name]
-            h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    if S.destroyed or not (room:IsA("Model") or room:IsA("Folder")) then return end
+    conn(room.ChildAdded, function(child)
+        if child.Name == "Generators" or child.Name == "Monsters" or child.Name == "Items" then
+            bindRoomFolder(child)
         else
-            tracked[name][h] = nil
+            onRoomItem(child)
+            bindBlotZone(child)
+        end
+    end, S.roomConns)
+    for _, child in ipairs(room:GetChildren()) do
+        if child.Name == "Generators" or child.Name == "Monsters" or child.Name == "Items" then
+            bindRoomFolder(child)
+        else
+            onRoomItem(child)
+            bindBlotZone(child)
         end
     end
-    if name == "PlayerESP" then
-        for bill in pairs(S.billboards) do
-            if bill and bill.Parent then
-                bill.Enabled = enabled.PlayerESP and S.playerInfoEnabled
-            else
-                S.billboards[bill] = nil
+end
+local function resetWorld()
+    disconnect(S.roomConns)
+    removeWorldVisuals()
+    clearGrabbers()
+    clearTracers()
+    if not worldNeeded() then return end
+    local function bindCurrent(current)
+        if not current or S.destroyed or not worldNeeded() then return end
+        conn(current.ChildAdded, bindRoom, S.roomConns)
+        for _, room in ipairs(current:GetChildren()) do bindRoom(room) end
+    end
+    conn(WS.ChildAdded, function(obj)
+        if obj.Name == "CurrentRoom" then bindCurrent(obj) end
+    end, S.roomConns)
+    bindCurrent(getCurrentRoom())
+end
+
+-- ============================================================
+-- PLAYER ESP: atualização de HP / distância SOMENTE quando ON
+-- ============================================================
+local playerToken = 0
+local function removePlayerVisuals()
+    for obj in pairs(S.playerObjects) do safeDestroy(obj) S.playerObjects[obj] = nil end
+end
+local function playerRefresh(p)
+    if S.destroyed or not flags.PlayerESP or p == LP then return end
+    local char = p.Character
+    local otherRoot = root(char)
+    if not char or not otherRoot then return end
+    local high = char:FindFirstChild("__DWLevePlayerESP")
+    if not high then
+        high = Instance.new("Highlight")
+        high.Name = "__DWLevePlayerESP"
+        high.Adornee = char
+        high.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        high.FillTransparency = .78
+        high.OutlineTransparency = 0
+        high.FillColor = colors.PlayerESP
+        high.OutlineColor = colors.PlayerESP
+        high.Parent = char
+        S.playerObjects[high] = true
+    end
+    local bill = otherRoot:FindFirstChild("__DWLevePlayerInfo")
+    if flags.PlayerInfo then
+        if not bill then
+            bill = Instance.new("BillboardGui")
+            bill.Name = "__DWLevePlayerInfo"
+            bill.Adornee = otherRoot
+            bill.AlwaysOnTop = true
+            bill.Size = UDim2.fromOffset(155, 44)
+            bill.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
+            bill.Parent = otherRoot
+            S.playerObjects[bill] = true
+            local frame = Instance.new("Frame")
+            frame.Name = "Holder"
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.BackgroundTransparency = .35
+            frame.BackgroundColor3 = Color3.fromRGB(12, 12, 14)
+            frame.Parent = bill
+            Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+            local label = Instance.new("TextLabel")
+            label.Name = "Info"
+            label.Size = UDim2.fromScale(1, 1)
+            label.BackgroundTransparency = 1
+            label.TextColor3 = colors.PlayerESP
+            label.TextSize = 11
+            label.TextWrapped = true
+            label.Font = Enum.Font.GothamBold
+            label.Parent = frame
+        end
+        local info = bill:FindFirstChild("Holder")
+        info = info and info:FindFirstChild("Info")
+        local myRoot = root(LP.Character)
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if info and myRoot then
+            info.Text = string.format("%s\n%dm | HP %d", p.DisplayName,
+                math.floor((otherRoot.Position - myRoot.Position).Magnitude + .5),
+                hum and math.floor(hum.Health + .5) or 0)
+        end
+    elseif bill then
+        S.playerObjects[bill] = nil
+        safeDestroy(bill)
+    end
+end
+local function resetPlayers()
+    playerToken += 1
+    disconnect(S.playerConns)
+    removePlayerVisuals()
+    if not flags.PlayerESP then return end
+    local token = playerToken
+    local function bindPlayer(p)
+        if p == LP then return end
+        conn(p.CharacterAdded, function()
+            task.delay(.35, function()
+                if not S.destroyed and token == playerToken then playerRefresh(p) end
+            end)
+        end, S.playerConns)
+        playerRefresh(p)
+    end
+    for _, p in ipairs(Players:GetPlayers()) do bindPlayer(p) end
+    conn(Players.PlayerAdded, bindPlayer, S.playerConns)
+    task.spawn(function()
+        while not S.destroyed and flags.PlayerESP and token == playerToken do
+            for _, p in ipairs(Players:GetPlayers()) do playerRefresh(p) end
+            task.wait(1)
+        end
+    end)
+end
+
+-- ============================================================
+-- AUTO SKILL CHECK: sem sobrescrever callback na inicialização
+-- ============================================================
+local skillToken = 0
+local function setSkill(value)
+    skillToken += 1
+    local token = skillToken
+    if not value then
+        if S.skillRemote and S.skillCallback then
+            pcall(function()
+                S.skillRemote.OnClientInvoke = S.skillOriginal
+            end)
+        end
+        S.skillRemote, S.skillOriginal, S.skillCallback = nil, nil, nil
+        return
+    end
+    task.spawn(function()
+        local events = RS:FindFirstChild("Events") or RS:WaitForChild("Events", 10)
+        if not events or token ~= skillToken or S.destroyed then return end
+        local remote = events:FindFirstChild("SkillcheckUpdate")
+            or events:WaitForChild("SkillcheckUpdate", 10)
+        if not remote or not remote:IsA("RemoteFunction")
+            or token ~= skillToken or S.destroyed then return end
+        local original = nil
+        if type(getcallbackvalue) == "function" then
+            local ok, result = pcall(getcallbackvalue, remote, "OnClientInvoke")
+            if ok and type(result) == "function" then original = result end
+        end
+        if not original then
+            pcall(function() original = remote.OnClientInvoke end)
+        end
+        local cb = function() return "supercomplete" end
+        local ok, err = pcall(function() remote.OnClientInvoke = cb end)
+        if ok then
+            S.skillRemote, S.skillOriginal, S.skillCallback = remote, original, cb
+        else
+            warn("[DW] AutoSkill indisponível: " .. tostring(err))
+        end
+    end)
+end
+
+-- ============================================================
+-- STAMINA + BUFF: rotina do patch que o usuário confirmou
+-- O observador de velocidade só funciona no loop da stamina ON.
+-- ============================================================
+local Stamina = { enabled = false, destroyed = false }
+local character, humanoid, sprinting, normalWalkSpeed
+local sprintHeld, controllerHeld, mobileHeld = false, false, false
+local sprintEvent, mobileConn, mobileButton
+local originalSprintConnections, originalMobileConnections = {}, {}
+local savedInterface = {}
+local speedBonus, lastAppliedSpeed, runSpeedBase, trackedCharacter = 0, nil, nil, nil
+
+local function refreshCharacter(char)
+    character = char
+    humanoid = char and (char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10))
+    local stats = char and (char:FindFirstChild("Stats") or char:WaitForChild("Stats", 10))
+    sprinting = stats and stats:FindFirstChild("Sprinting")
+    normalWalkSpeed = humanoid and humanoid.WalkSpeed
+    sprintHeld, controllerHeld, mobileHeld = false, false, false
+    speedBonus, lastAppliedSpeed, runSpeedBase, trackedCharacter = 0, nil, nil, char
+end
+local function findSprintEvent()
+    local events = RS:FindFirstChild("Events")
+    local evt = events and events:FindFirstChild("SprintEvent")
+    sprintEvent = evt and evt:IsA("RemoteEvent") and evt or nil
+end
+local function setCapturedEnabled(bucket, yes)
+    for _, c in ipairs(bucket) do
+        pcall(function()
+            if yes then c:Enable() else c:Disable() end
+        end)
+    end
+end
+local function captureConnections(signal, bucket)
+    if type(getconnections) ~= "function" or not signal then return end
+    local ok, list = pcall(getconnections, signal)
+    if not ok or type(list) ~= "table" then return end
+    for _, c in ipairs(list) do
+        if c ~= mobileConn then
+            local exists = false
+            for _, saved in ipairs(bucket) do
+                if saved == c then exists = true break end
+            end
+            if not exists then table.insert(bucket, c) end
+        end
+    end
+end
+local function sprintWanted()
+    return Stamina.enabled and (sprintHeld or controllerHeld or mobileHeld)
+end
+local function getRunSpeed()
+    if not humanoid or not humanoid.Parent or not normalWalkSpeed then return nil end
+    if trackedCharacter ~= character then
+        trackedCharacter = character
+        speedBonus, lastAppliedSpeed, runSpeedBase = 0, nil, nil
+    end
+    if not runSpeedBase then
+        local initialSpeed = LP:GetAttribute("KM_MAX_PLAYER_SPEED")
+        runSpeedBase = (type(initialSpeed) == "number" and initialSpeed > 0)
+            and initialSpeed or (normalWalkSpeed + 10)
+    end
+    local observed = humanoid.WalkSpeed
+    if lastAppliedSpeed == nil or math.abs(observed - lastAppliedSpeed) > .05 then
+        local fromWalk = observed - normalWalkSpeed
+        local fromRun = observed - runSpeedBase
+        local possible = nil
+        if fromWalk >= 0 then possible = fromWalk end
+        if fromRun >= 0 and (possible == nil or
+            math.abs(fromRun - speedBonus) < math.abs(possible - speedBonus)) then
+            possible = fromRun
+        end
+        if possible ~= nil then speedBonus = math.clamp(possible, 0, 15) end
+    end
+    return runSpeedBase + speedBonus
+end
+local function applySpeedState()
+    if not humanoid or not humanoid.Parent or not normalWalkSpeed then return end
+    local desired
+    if sprintWanted() then desired = getRunSpeed()
+    else desired = normalWalkSpeed + speedBonus end
+    if type(desired) ~= "number" or desired <= 0 then return end
+    lastAppliedSpeed = desired
+    if math.abs(humanoid.WalkSpeed - desired) > .05 then
+        humanoid.WalkSpeed = desired
+    end
+end
+local function sendSprint(value)
+    if not sprintEvent then findSprintEvent() end
+    if sprintEvent then pcall(function() sprintEvent:FireServer(value) end) end
+end
+local function updateMobileInterface(on)
+    local screen = PG:FindFirstChild("ScreenGui")
+    local button = screen and screen:FindFirstChild("MobileRun")
+    if not button then return end
+    if not savedInterface[button] then
+        savedInterface[button] = { Image = button.Image }
+    end
+    local txt = button:FindFirstChild("TextLabel")
+    if txt and not savedInterface[txt] then savedInterface[txt] = { Text = txt.Text } end
+    if txt then txt.Text = on and "SPRINT: ON" or "SPRINT: OFF" end
+    pcall(function()
+        button.Image = on and "rbxassetid://11866539249" or "rbxassetid://11866517702"
+    end)
+    local icon = screen:FindFirstChild("SprintIcon")
+    if icon and on then
+        if not savedInterface[icon] then savedInterface[icon] = { Visible = icon.Visible } end
+        icon.Visible = false
+    end
+end
+local function restoreInterface()
+    for obj, props in pairs(savedInterface) do
+        if obj and obj.Parent then
+            for key, val in pairs(props) do
+                pcall(function() obj[key] = val end)
             end
         end
+        savedInterface[obj] = nil
     end
 end
-
-local function supercompleteCallback(...)
-    return "supercomplete"
+local function startSprint()
+    if not Stamina.enabled then return end
+    if sprinting and sprinting.Parent then pcall(function() sprinting.Value = true end) end
+    applySpeedState()
+    updateMobileInterface(true)
+    sendSprint(true)
 end
-
-local function setSkillEnabled(value)
-    S.skillEnabled = value
-    if not S.skillRemote then return end
-
-    local ok, err = pcall(function()
-        S.skillRemote.OnClientInvoke = value
-            and supercompleteCallback
-            or S.originalSkillCallback
+local function stopSprint()
+    if sprinting and sprinting.Parent then pcall(function() sprinting.Value = false end) end
+    updateMobileInterface(false)
+    sendSprint(false)
+    applySpeedState()
+end
+local function bindMobile()
+    if not Stamina.enabled then return end
+    local screen = PG:FindFirstChild("ScreenGui")
+    local button = screen and screen:FindFirstChild("MobileRun")
+    if not button or button == mobileButton then return end
+    setCapturedEnabled(originalMobileConnections, true)
+    table.clear(originalMobileConnections)
+    if mobileConn then mobileConn:Disconnect() mobileConn = nil end
+    mobileButton = button
+    captureConnections(button.Activated, originalMobileConnections)
+    mobileConn = conn(button.Activated, function()
+        if not Stamina.enabled then return end
+        mobileHeld = not mobileHeld
+        if mobileHeld then startSprint() else stopSprint() end
+    end, S.staminaConns)
+    setCapturedEnabled(originalMobileConnections, false)
+end
+function Stamina:SetEnabled(value)
+    if self.destroyed or self.enabled == value then return end
+    self.enabled = value
+    if value then
+        if not humanoid or not humanoid.Parent then
+            local char = LP.Character
+            if char then refreshCharacter(char) end
+        end
+        findSprintEvent()
+        if sprintEvent then
+            captureConnections(sprintEvent.OnClientEvent, originalSprintConnections)
+            setCapturedEnabled(originalSprintConnections, false)
+        end
+        bindMobile()
+        if sprintWanted() then startSprint() end
+    else
+        sprintHeld, controllerHeld, mobileHeld = false, false, false
+        stopSprint()
+        setCapturedEnabled(originalSprintConnections, true)
+        setCapturedEnabled(originalMobileConnections, true)
+        table.clear(originalSprintConnections)
+        table.clear(originalMobileConnections)
+        if mobileConn then mobileConn:Disconnect() mobileConn = nil end
+        mobileButton = nil
+        restoreInterface()
+    end
+end
+function Stamina:Destroy()
+    if self.destroyed then return end
+    if self.enabled then self:SetEnabled(false) end
+    self.destroyed = true
+    disconnect(S.staminaConns)
+end
+S.staminaController = Stamina
+refreshCharacter(LP.Character)
+conn(LP.CharacterAdded, function(char)
+    refreshCharacter(char)
+    if Stamina.enabled then
+        task.defer(function() if not S.destroyed then bindMobile() end end)
+    end
+    if flags.ItemTracer then task.defer(resetWorld) end
+end)
+conn(PG.DescendantAdded, function(obj)
+    if obj.Name == "MobileRun" and Stamina.enabled then
+        task.defer(function() if not S.destroyed then bindMobile() end end)
+    end
+end)
+conn(UIS.InputBegan, function(input, processed)
+    if processed or not Stamina.enabled then return end
+    if input.KeyCode == Enum.KeyCode.LeftShift then
+        if not sprintHeld then sprintHeld = true startSprint() end
+    elseif input.KeyCode == Enum.KeyCode.ButtonR1 then
+        if not controllerHeld then controllerHeld = true startSprint() end
+    end
+end)
+conn(UIS.InputEnded, function(input)
+    if not Stamina.enabled then return end
+    if input.KeyCode == Enum.KeyCode.LeftShift then sprintHeld = false
+    elseif input.KeyCode == Enum.KeyCode.ButtonR1 then controllerHeld = false
+    else return end
+    if not (sprintHeld or controllerHeld or mobileHeld) then stopSprint() end
+end)
+local staminaToken = 0
+local function runStaminaLoop()
+    staminaToken += 1
+    local token = staminaToken
+    if not Stamina.enabled then return end
+    task.spawn(function()
+        while not S.destroyed and Stamina.enabled and token == staminaToken do
+            if sprintWanted() then
+                if sprinting and sprinting.Parent then
+                    pcall(function() sprinting.Value = true end)
+                end
+                applySpeedState()
+            end
+            task.wait(.22)
+        end
     end)
-    if not ok then
-        warn("Auto Skill Check: " .. tostring(err))
+end
+
+-- ============================================================
+-- EXTRAS VISUAIS: só executados quando o usuário habilitar
+-- ============================================================
+local cam = WS.CurrentCamera
+local originalFOV = cam and cam.FieldOfView or 70
+local targetFOV = math.clamp(math.floor(originalFOV + .5), 40, 120)
+local originalLighting = {}
+for _, prop in ipairs({"Brightness", "ClockTime", "FogEnd", "GlobalShadows", "Ambient"}) do
+    originalLighting[prop] = Lighting[prop]
+end
+local function applyLighting()
+    if flags.FullBright then
+        Lighting.Brightness = 3
+        Lighting.ClockTime = 14
+        Lighting.FogEnd = 100000
+        Lighting.GlobalShadows = false
+        Lighting.Ambient = Color3.fromRGB(170, 170, 170)
+    else
+        for prop, val in pairs(originalLighting) do
+            pcall(function() Lighting[prop] = val end)
+        end
     end
+end
+local function applyFOV()
+    local camera = WS.CurrentCamera
+    if camera and flags.FOV and math.abs(camera.FieldOfView - targetFOV) > .05 then
+        camera.FieldOfView = targetFOV
+    end
+end
+local extraToken = 0
+local function updateExtras()
+    extraToken += 1
+    local token = extraToken
+    if not (flags.FullBright or flags.FOV) then return end
+    task.spawn(function()
+        while not S.destroyed and token == extraToken
+            and (flags.FullBright or flags.FOV) do
+            if flags.FullBright then applyLighting() end
+            if flags.FOV then applyFOV() end
+            task.wait(.6)
+        end
+    end)
+end
+
+local function setFlag(key, val)
+    if flags[key] == nil or flags[key] == val or S.destroyed then return end
+    flags[key] = val
+    if key == "GeneratorESP" or key == "MonsterESP" or key == "ItemESP"
+        or key == "ItemTracer" or key == "RareBillboard" then
+        resetWorld()
+    elseif key == "PlayerESP" or key == "PlayerInfo" then
+        resetPlayers()
+    elseif key == "AutoSkill" then
+        setSkill(val)
+    elseif key == "InfiniteStamina" then
+        Stamina:SetEnabled(val)
+        runStaminaLoop()
+    elseif key == "FullBright" then
+        applyLighting()
+        updateExtras()
+    elseif key == "FOV" then
+        if not val and WS.CurrentCamera then WS.CurrentCamera.FieldOfView = originalFOV end
+        updateExtras()
+    elseif (key == "HideVee" or key == "HideIchor") and val then
+        for obj, watch in pairs(watchGui) do
+            if watch.flag == key then hideGui(obj, key) end
+        end
+    end
+    print("[DW] " .. key .. ": " .. (val and "ON" or "OFF"))
 end
 
 function S:Destroy()
     if self.destroyed then return end
     self.destroyed = true
-
-    if self.staminaController then
-        pcall(function() self.staminaController:Destroy() end)
-        self.staminaController = nil
+    -- Restaura callbacks e conexão desabilitada mesmo ao sair.
+    Stamina:Destroy()
+    setSkill(false)
+    disconnect(self.roomConns)
+    disconnect(self.playerConns)
+    disconnect(self.connections)
+    removeWorldVisuals()
+    removePlayerVisuals()
+    clearGrabbers()
+    clearTracers()
+    for obj, watch in pairs(watchGui) do
+        disconnect(watch.conns)
+        watchGui[obj] = nil
     end
-    if self.restoreFOV then pcall(self.restoreFOV) end
-    if self.gui then pcall(function() self.gui:Destroy() end) end
-    if self.tracerAttachment then pcall(function() self.tracerAttachment:Destroy() end) end
-    for _, beam in pairs(self.tracers) do pcall(function() beam:Destroy() end) end
-    if self.originalLighting then
-        local lighting = game:GetService("Lighting")
-        for property, value in pairs(self.originalLighting) do pcall(function() lighting[property] = value end) end
-    end
-    if self.rareBillboardController then
-        pcall(function() self.rareBillboardController:Destroy() end)
-        self.rareBillboardController = nil
-    end
-
-    for _, connection in ipairs(self.connections) do
-        pcall(function() connection:Disconnect() end)
-    end
-    for h in pairs(self.highlights) do
-        pcall(function() h:Destroy() end)
-    end
-    for bill in pairs(self.billboards) do
-        pcall(function() bill:Destroy() end)
-    end
-    if self.skillRemote then
-        pcall(function()
-            self.skillRemote.OnClientInvoke = self.originalSkillCallback
-        end)
-    end
+    flags.FullBright = false
+    applyLighting()
+    if flags.FOV and WS.CurrentCamera then WS.CurrentCamera.FieldOfView = originalFOV end
+    if self.ui then safeDestroy(self.ui) end
     if env[KEY] == self then env[KEY] = nil end
 end
 
-for _, room in ipairs(CurrentRoom:GetChildren()) do
-    bindRoom(room)
+-- ============================================================
+-- PAINEL F6 (UI leve, rolável, arrastável)
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "__DW_PANEL_F6_LEVE"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.DisplayOrder = 150
+gui.Parent = PG
+S.ui = gui
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.fromOffset(330, 500)
+panel.Position = UDim2.new(1, -350, .13, 0)
+panel.BackgroundColor3 = Color3.fromRGB(9, 9, 11)
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+local stroke = Instance.new("UIStroke", panel)
+stroke.Color = Color3.fromRGB(170, 170, 170)
+stroke.Thickness = 1
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 44)
+header.BackgroundTransparency = 1
+header.Active = true
+header.Parent = panel
+local title = Instance.new("TextLabel")
+title.Position = UDim2.fromOffset(13, 0)
+title.Size = UDim2.new(1, -60, 1, 0)
+title.BackgroundTransparency = 1
+title.Text = "Painel DW  |  LEVE"
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(250, 250, 250)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.Parent = header
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(30, 28)
+close.Position = UDim2.new(1, -40, 0, 7)
+close.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+close.Text = "X"
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 13
+close.Parent = header
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+conn(close.Activated, function() gui.Enabled = false end)
+local scroll = Instance.new("ScrollingFrame")
+scroll.Position = UDim2.fromOffset(12, 48)
+scroll.Size = UDim2.new(1, -24, 1, -75)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.CanvasSize = UDim2.fromOffset(0, 0)
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = panel
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 7)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = scroll
+local function section(label)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -5, 0, 21)
+    t.BackgroundTransparency = 1
+    t.Text = label
+    t.TextColor3 = Color3.fromRGB(175, 175, 175)
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 11
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.Parent = scroll
 end
-connect(CurrentRoom.ChildAdded, bindRoom)
-
-for _, player in ipairs(Players:GetPlayers()) do
-    bindPlayer(player)
-end
-connect(Players.PlayerAdded, bindPlayer)
-
-
-task.spawn(function()
-    while not S.destroyed do
-        if enabled.PlayerESP then
-            for _, player in ipairs(Players:GetPlayers()) do
-                updatePlayer(player)
-            end
-        end
-        task.wait(1)
+local function toggle(textValue, key)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -6, 0, 35)
+    row.BackgroundColor3 = Color3.fromRGB(28, 28, 30)
+    row.BorderSizePixel = 0
+    row.Parent = scroll
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
+    local label = Instance.new("TextLabel")
+    label.Position = UDim2.fromOffset(10, 0)
+    label.Size = UDim2.new(1, -92, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = textValue
+    label.TextColor3 = Color3.fromRGB(240, 240, 240)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(65, 25)
+    b.Position = UDim2.new(1, -72, .5, -12)
+    b.TextSize = 11
+    b.Font = Enum.Font.GothamBold
+    b.Parent = row
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local function paint()
+        b.Text = flags[key] and "ON" or "OFF"
+        b.BackgroundColor3 = flags[key] and Color3.fromRGB(235, 235, 235)
+            or Color3.fromRGB(60, 60, 60)
+        b.TextColor3 = flags[key] and Color3.fromRGB(12, 12, 12)
+            or Color3.fromRGB(255, 255, 255)
     end
-end)
-
-task.spawn(function()
-    local events = ReplicatedStorage:WaitForChild("Events", 10)
-    if S.destroyed or not events then return end
-
-    local remote = events:WaitForChild("SkillcheckUpdate", 10)
-    if S.destroyed or not remote or not remote:IsA("RemoteFunction") then
-        warn("Auto Skill Check: SkillcheckUpdate indisponivel")
-        return
-    end
-
-    S.skillRemote = remote
-    local original = nil
-    if type(getcallbackvalue) == "function" then
-        local ok, callback = pcall(getcallbackvalue, remote, "OnClientInvoke")
-        if ok and type(callback) == "function" then
-            original = callback
-        end
-    end
-    if not original then
-        local ok, callback = pcall(function()
-            return remote.OnClientInvoke
-        end)
-        if ok and type(callback) == "function" then
-            original = callback
-        end
-    end
-    S.originalSkillCallback = original
-    setSkillEnabled(S.skillEnabled)
-end)
-
--- Billboard de cooldown para Scraps, Goob e Gigi (do segundo script).
--- Separado do billboard de jogadores e integrado ao ciclo de vida do ESP.
-do
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local Workspace = game:GetService("Workspace")
-
-local LocalPlayer = Players.LocalPlayer
-local TOGGLE_KEY = Enum.KeyCode.KeypadSix
-local BILLBOARD_NAME = "__RareGrabCooldownBillboard"
-
-local MONSTER_CONFIG = {
-    ScrapsMonster = {
-        displayName = "SCRAPS",
-        cooldown = 12,
-        readyText = "GRAB READY",
-        activeText = "GRABBING",
-        windupTimeout = 2.5,
-    },
-
-    GoobMonster = {
-        displayName = "GOOB",
-        cooldown = 10,
-        readyText = "GRAB READY",
-        activeText = "GRABBING",
-        windupTimeout = 2.0,
-    },
-
-    GigiMonster = {
-        displayName = "GIGI",
-        cooldown = 10,
-        readyText = "STEAL READY",
-        activeText = "STEALING",
-        windupTimeout = 2.0,
-    },
-}
-
-local COLORS = {
-    READY = Color3.fromRGB(255, 90, 90),
-    WINDUP = Color3.fromRGB(255, 215, 70),
-    ACTIVE = Color3.fromRGB(255, 80, 170),
-    COOLDOWN = Color3.fromRGB(100, 220, 255),
-}
-
-local environment = getgenv and getgenv() or _G
-
-if environment.__RARE_GRAB_BILLBOARDS
-    and environment.__RARE_GRAB_BILLBOARDS.Destroy then
-
-    pcall(function()
-        environment.__RARE_GRAB_BILLBOARDS:Destroy()
-    end)
-end
-
-local Controller = {
-    enabled = true,
-    destroyed = false,
-    connections = {},
-    trackers = setmetatable({}, { __mode = "k" }),
-}
-
-environment.__RARE_GRAB_BILLBOARDS = Controller
-S.rareBillboardController = Controller
-
-local pendingMonsters = setmetatable({}, { __mode = "k" })
-
-local function disconnectList(list)
-    for _, connection in ipairs(list) do
-        pcall(function()
-            connection:Disconnect()
-        end)
-    end
-
-    table.clear(list)
-end
-
-function Controller:Connect(signal, callback, list)
-    local connection = signal:Connect(callback)
-    table.insert(list or self.connections, connection)
-    return connection
-end
-
-local function normalizeAnimationId(animationId)
-    return tostring(animationId):match("%d+") or ""
-end
-
-local function lower(text)
-    return string.lower(tostring(text))
-end
-
-local function isInsideCurrentRoom(object)
-    local currentRoom = Workspace:FindFirstChild("CurrentRoom")
-
-    return currentRoom ~= nil
-        and object ~= nil
-        and object:IsDescendantOf(currentRoom)
-end
-
-local function isTargetMonster(object)
-    if not object
-        or not object:IsA("Model")
-        or not MONSTER_CONFIG[object.Name]
-        or not object.Parent
-        or object.Parent.Name ~= "Monsters" then
-
-        return false
-    end
-
-    return isInsideCurrentRoom(object)
-end
-
-local function findAnchor(monster, waitTime)
-    local anchor = monster:FindFirstChild("Head")
-        or monster:FindFirstChild("HumanoidRootPart")
-        or monster:FindFirstChildWhichIsA("BasePart", true)
-
-    if anchor then
-        return anchor
-    end
-
-    if waitTime and waitTime > 0 then
-        anchor = monster:WaitForChild("HumanoidRootPart", waitTime)
-
-        if anchor and anchor:IsA("BasePart") then
-            return anchor
-        end
-    end
-
-    return monster:FindFirstChild("Head")
-        or monster:FindFirstChild("HumanoidRootPart")
-        or monster:FindFirstChildWhichIsA("BasePart", true)
-end
-
-local function calculateOffset(monster, anchor)
-    if anchor and anchor.Name == "Head" then
-        return Vector3.new(0, 3.25, 0)
-    end
-
-    local success, size = pcall(function()
-        return monster:GetExtentsSize()
-    end)
-
-    if success then
-        return Vector3.new(0, math.max(4, size.Y * 0.5 + 1.75), 0)
-    end
-
-    return Vector3.new(0, 5, 0)
-end
-
-local function createBillboard(monster, config)
-    local old = monster:FindFirstChild(BILLBOARD_NAME, true)
-
-    if old then
-        old:Destroy()
-    end
-
-    local anchor = findAnchor(monster, 6)
-
-    if not anchor then
-        return nil
-    end
-
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name = BILLBOARD_NAME
-    billboard.Adornee = anchor
-    billboard.AlwaysOnTop = true
-    billboard.LightInfluence = 0
-    billboard.MaxDistance = 0
-    billboard.Size = UDim2.fromOffset(134, 43)
-    billboard.StudsOffsetWorldSpace = calculateOffset(monster, anchor)
-    billboard.Enabled = Controller.enabled
-    billboard.Parent = anchor
-
-    local frame = Instance.new("Frame")
-    frame.Name = "Container"
-    frame.Size = UDim2.fromScale(1, 1)
-    frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
-    frame.BackgroundTransparency = 0.16
-    frame.BorderSizePixel = 0
-    frame.Parent = billboard
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 5)
-    corner.Parent = frame
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Name = "StateStroke"
-    stroke.Thickness = 1
-    stroke.Transparency = 0.1
-    stroke.Color = COLORS.READY
-    stroke.Parent = frame
-
-    local title = Instance.new("TextLabel")
-    title.Name = "MonsterName"
-    title.BackgroundTransparency = 1
-    title.Position = UDim2.fromOffset(3, 2)
-    title.Size = UDim2.new(1, -6, 0, 15)
-    title.Font = Enum.Font.GothamBold
-    title.Text = config.displayName
-    title.TextColor3 = Color3.fromRGB(235, 235, 240)
-    title.TextSize = 10
-    title.TextStrokeTransparency = 0.7
-    title.Parent = frame
-
-    local state = Instance.new("TextLabel")
-    state.Name = "State"
-    state.BackgroundTransparency = 1
-    state.Position = UDim2.fromOffset(3, 14)
-    state.Size = UDim2.new(1, -6, 0, 24)
-    state.Font = Enum.Font.GothamBlack
-    state.Text = config.readyText
-    state.TextColor3 = COLORS.READY
-    state.TextSize = 13
-    state.TextStrokeColor3 = Color3.new(0, 0, 0)
-    state.TextStrokeTransparency = 0.35
-    state.Parent = frame
-
-    return {
-        gui = billboard,
-        frame = frame,
-        stroke = stroke,
-        title = title,
-        stateLabel = state,
-    }
-end
-
-local function applyVisual(tracker, text, color)
-    if not tracker.visual
-        or not tracker.visual.gui
-        or not tracker.visual.gui.Parent then
-
-        return
-    end
-
-    tracker.visual.stateLabel.Text = text
-    tracker.visual.stateLabel.TextColor3 = color
-    tracker.visual.stroke.Color = color
-end
-
-local function setState(tracker, newState)
-    if not tracker or tracker.destroyed then
-        return
-    end
-
-    tracker.state = newState
-
-    if newState == "READY" then
-        tracker.windupDeadline = nil
-        tracker.cooldownEndsAt = nil
-        applyVisual(tracker, tracker.config.readyText, COLORS.READY)
-
-    elseif newState == "WINDUP" then
-        tracker.windupDeadline = os.clock()
-            + (tracker.config.windupTimeout or 2.5)
-
-        applyVisual(tracker, "WINDUP", COLORS.WINDUP)
-
-    elseif newState == "ACTIVE" then
-        tracker.windupDeadline = nil
-        applyVisual(tracker, tracker.config.activeText, COLORS.ACTIVE)
-
-    elseif newState == "COOLDOWN" then
-        tracker.windupDeadline = nil
-
-        local remaining = math.max(
-            0,
-            (tracker.cooldownEndsAt or os.clock()) - os.clock()
-        )
-
-        applyVisual(
-            tracker,
-            string.format("%.1fs", remaining),
-            COLORS.COOLDOWN
-        )
-    end
-end
-
-local function startCooldown(tracker)
-    if not tracker or tracker.destroyed then
-        return
-    end
-
-    tracker.windupDeadline = nil
-    tracker.cooldownEndsAt = os.clock() + tracker.config.cooldown
-    setState(tracker, "COOLDOWN")
-end
-
-local function buildAnimationMap(monster)
-    local animationMap = {}
-
-    for _, object in ipairs(monster:GetDescendants()) do
-        if object:IsA("Animation") then
-            local id = normalizeAnimationId(object.AnimationId)
-            local name = lower(object.Name)
-
-            if id ~= "" then
-                if string.find(name, "windup", 1, true) then
-                    animationMap[id] = "WINDUP"
-                elseif name == "grab"
-                    or string.find(name, "rangedgrab", 1, true)
-                    or string.find(name, "steal", 1, true) then
-
-                    animationMap[id] = "WINDUP"
-                end
-            end
-        end
-    end
-
-    return animationMap
-end
-
-local function bindAnimator(tracker, animator)
-    if not animator
-        or not animator:IsA("Animator")
-        or tracker.boundAnimators[animator] then
-
-        return
-    end
-
-    tracker.boundAnimators[animator] = true
-
-    Controller:Connect(
-        animator.AnimationPlayed,
-        function(track)
-            if tracker.destroyed then
-                return
-            end
-
-            local animation = track.Animation
-            local animationId = animation
-                and normalizeAnimationId(animation.AnimationId)
-                or ""
-
-            local animationName = lower(
-                animation and animation.Name or track.Name
-            )
-
-            local classifiedState = tracker.animationMap[animationId]
-
-            if not classifiedState then
-                if string.find(animationName, "windup", 1, true)
-                    or animationName == "grab"
-                    or string.find(animationName, "rangedgrab", 1, true)
-                    or string.find(animationName, "steal", 1, true) then
-
-                    classifiedState = "WINDUP"
-                end
-            end
-
-            if classifiedState == "WINDUP"
-                and tracker.state ~= "ACTIVE" then
-
-                setState(tracker, "WINDUP")
-            end
-        end,
-        tracker.connections
-    )
-end
-
-local function cleanupTracker(tracker)
-    if not tracker or tracker.destroyed then
-        return
-    end
-
-    tracker.destroyed = true
-    disconnectList(tracker.connections)
-
-    if tracker.visual
-        and tracker.visual.gui
-        and tracker.visual.gui.Parent then
-
-        tracker.visual.gui:Destroy()
-    end
-
-    Controller.trackers[tracker.monster] = nil
-end
-
-local function trackMonster(monster)
-    if Controller.destroyed
-        or not isTargetMonster(monster)
-        or Controller.trackers[monster]
-        or pendingMonsters[monster] then
-
-        return
-    end
-
-    pendingMonsters[monster] = true
-
-    task.spawn(function()
-        if not monster.Parent or not isTargetMonster(monster) then
-            pendingMonsters[monster] = nil
-            return
-        end
-
-        local config = MONSTER_CONFIG[monster.Name]
-        local visual = createBillboard(monster, config)
-
-        if Controller.destroyed then
-            pendingMonsters[monster] = nil
-            if visual and visual.gui then
-                visual.gui:Destroy()
-            end
-            return
-        end
-
-        if not visual then
-            pendingMonsters[monster] = nil
-
-            if monster.Parent and isTargetMonster(monster) then
-                task.delay(1, function()
-                    trackMonster(monster)
-                end)
-            end
-
-            return
-        end
-
-        local tracker = {
-            monster = monster,
-            config = config,
-            visual = visual,
-            state = "READY",
-            cooldownEndsAt = nil,
-            windupDeadline = nil,
-            wasGrabbing = false,
-            destroyed = false,
-            connections = {},
-            boundAnimators = setmetatable({}, { __mode = "k" }),
-            animationMap = buildAnimationMap(monster),
-        }
-
-        Controller.trackers[monster] = tracker
-        pendingMonsters[monster] = nil
-
-        local grabbing = monster:FindFirstChild("Grabbing")
-            or monster:WaitForChild("Grabbing", 5)
-
-        if grabbing and grabbing:IsA("BoolValue") then
-            tracker.wasGrabbing = grabbing.Value
-
-            if grabbing.Value then
-                setState(tracker, "ACTIVE")
-            else
-                setState(tracker, "READY")
-            end
-
-            Controller:Connect(
-                grabbing:GetPropertyChangedSignal("Value"),
-                function()
-                    if tracker.destroyed then
-                        return
-                    end
-
-                    local isGrabbing = grabbing.Value
-
-                    if isGrabbing then
-                        tracker.windupDeadline = nil
-                        tracker.cooldownEndsAt = nil
-                        setState(tracker, "ACTIVE")
-                    elseif tracker.wasGrabbing then
-                        startCooldown(tracker)
-                    end
-
-                    tracker.wasGrabbing = isGrabbing
-                end,
-                tracker.connections
-            )
-        else
-            setState(tracker, "READY")
-        end
-
-        local chasing = monster:FindFirstChild("Chasing")
-
-        if chasing and chasing:IsA("BoolValue") then
-            Controller:Connect(
-                chasing:GetPropertyChangedSignal("Value"),
-                function()
-                    if tracker.destroyed then
-                        return
-                    end
-
-                    if not chasing.Value
-                        and tracker.state == "WINDUP"
-                        and not (grabbing and grabbing.Value) then
-
-                        startCooldown(tracker)
-                    end
-                end,
-                tracker.connections
-            )
-        end
-
-        local animator = monster:FindFirstChildWhichIsA("Animator", true)
-
-        if animator then
-            bindAnimator(tracker, animator)
-        end
-
-        Controller:Connect(
-            monster.DescendantAdded,
-            function(object)
-                if tracker.destroyed then
-                    return
-                end
-
-                if object:IsA("Animator") then
-                    bindAnimator(tracker, object)
-                end
-
-                if object:IsA("Animation") then
-                    local id = normalizeAnimationId(object.AnimationId)
-                    local name = lower(object.Name)
-
-                    if id ~= "" then
-                        if string.find(name, "windup", 1, true)
-                            or name == "grab"
-                            or string.find(name, "rangedgrab", 1, true)
-                            or string.find(name, "steal", 1, true) then
-
-                            tracker.animationMap[id] = "WINDUP"
-                        end
-                    end
-                end
-
-                local objectName = lower(object.Name)
-
-                if string.find(
-                    objectName,
-                    "rangedwindupsound",
-                    1,
-                    true
-                ) then
-                    if tracker.state ~= "ACTIVE" then
-                        setState(tracker, "WINDUP")
-                    end
-                end
-            end,
-            tracker.connections
-        )
-
-        Controller:Connect(
-            monster.AncestryChanged,
-            function()
-                if tracker.destroyed then
-                    return
-                end
-
-                if not monster.Parent
-                    or not isInsideCurrentRoom(monster) then
-
-                    cleanupTracker(tracker)
-                end
-            end,
-            tracker.connections
-        )
-
-    end)
-end
-
-function Controller:SetEnabled(enabled)
-    self.enabled = enabled
-
-    for _, tracker in pairs(self.trackers) do
-        if tracker.visual
-            and tracker.visual.gui
-            and tracker.visual.gui.Parent then
-
-            tracker.visual.gui.Enabled = enabled
-        end
-    end
-
-end
-
-function Controller:Destroy()
-    if self.destroyed then
-        return
-    end
-
-    self.destroyed = true
-
-    for _, tracker in pairs(self.trackers) do
-        cleanupTracker(tracker)
-    end
-
-    disconnectList(self.connections)
-
-    if environment.__RARE_GRAB_BILLBOARDS == self then
-        environment.__RARE_GRAB_BILLBOARDS = nil
-    end
-end
-
-
-local billboardBoundRooms = setmetatable({}, { __mode = "k" })
-local billboardBoundMonsterFolders = setmetatable({}, { __mode = "k" })
-local billboardBoundCurrentRooms = setmetatable({}, { __mode = "k" })
-
-local function scanBillboardMonsterFolder(monstersFolder)
-    if Controller.destroyed or not monstersFolder then
-        return
-    end
-
-    for _, monster in ipairs(monstersFolder:GetChildren()) do
-        if monster:IsA("Model")
-            and MONSTER_CONFIG[monster.Name] then
-
-            trackMonster(monster)
-        end
-    end
-end
-
-local function bindBillboardMonsterFolder(monstersFolder)
-    if Controller.destroyed
-        or not monstersFolder
-        or billboardBoundMonsterFolders[monstersFolder] then
-
-        return
-    end
-
-    billboardBoundMonsterFolders[monstersFolder] = true
-
-    Controller:Connect(
-        monstersFolder.ChildAdded,
-        function(monster)
-            if monster:IsA("Model")
-                and MONSTER_CONFIG[monster.Name] then
-
-                trackMonster(monster)
-            end
-        end
-    )
-
-    scanBillboardMonsterFolder(monstersFolder)
-
-    task.delay(0.75, function()
-        if monstersFolder.Parent then
-            scanBillboardMonsterFolder(monstersFolder)
-        end
-    end)
-
-    task.delay(2.0, function()
-        if monstersFolder.Parent then
-            scanBillboardMonsterFolder(monstersFolder)
-        end
-    end)
-end
-
-local function bindBillboardRoom(room)
-    if Controller.destroyed
-        or not room
-        or not room:IsA("Model")
-        or billboardBoundRooms[room] then
-
-        return
-    end
-
-    billboardBoundRooms[room] = true
-
-    Controller:Connect(
-        room.ChildAdded,
-        function(child)
-            if child.Name == "Monsters" then
-                bindBillboardMonsterFolder(child)
-            end
-        end
-    )
-
-    local monstersFolder = room:FindFirstChild("Monsters")
-
-    if monstersFolder then
-        bindBillboardMonsterFolder(monstersFolder)
-    end
-end
-
-local function bindCurrentRoomFolder(currentRoomFolder)
-    if Controller.destroyed
-        or not currentRoomFolder
-        or billboardBoundCurrentRooms[currentRoomFolder] then
-
-        return
-    end
-
-    billboardBoundCurrentRooms[currentRoomFolder] = true
-
-    Controller:Connect(
-        currentRoomFolder.ChildAdded,
-        function(room)
-            if room:IsA("Model") then
-                bindBillboardRoom(room)
-            end
-        end
-    )
-
-    for _, room in ipairs(currentRoomFolder:GetChildren()) do
-        if room:IsA("Model") then
-            bindBillboardRoom(room)
-        end
-    end
-end
-
-local billboardCurrentRoom = Workspace:FindFirstChild("CurrentRoom")
-
-if billboardCurrentRoom then
-    bindCurrentRoomFolder(billboardCurrentRoom)
-end
-
-Controller:Connect(
-    Workspace.ChildAdded,
-    function(child)
-        if child.Name == "CurrentRoom" then
-            bindCurrentRoomFolder(child)
-        end
-    end
-)
-
-local billboardUpdateAccumulator = 0
-
-Controller:Connect(
-    RunService.Heartbeat,
-    function(deltaTime)
-        if Controller.destroyed then
-            return
-        end
-
-        billboardUpdateAccumulator += deltaTime
-
-        if billboardUpdateAccumulator < 0.10 then
-            return
-        end
-
-        billboardUpdateAccumulator = 0
-
-        local now = os.clock()
-
-        for monster, tracker in pairs(Controller.trackers) do
-            if tracker.destroyed or not monster.Parent then
-                cleanupTracker(tracker)
-
-            elseif tracker.state == "WINDUP"
-                and tracker.windupDeadline
-                and now >= tracker.windupDeadline then
-
-                local grabbing = monster:FindFirstChild("Grabbing")
-
-                if grabbing
-                    and grabbing:IsA("BoolValue")
-                    and grabbing.Value then
-
-                    setState(tracker, "ACTIVE")
-                else
-                    startCooldown(tracker)
-                end
-
-            elseif tracker.state == "COOLDOWN" then
-                local remaining =
-                    (tracker.cooldownEndsAt or 0) - now
-
-                if remaining <= 0 then
-                    setState(tracker, "READY")
-                else
-                    applyVisual(
-                        tracker,
-                        string.format("%.1fs", remaining),
-                        COLORS.COOLDOWN
-                    )
-                end
-            end
-        end
-    end
-)
-end
-
--- ESP, Auto Skill Check e billboard de monstros inicializados
-
-
-
-
--- SISTEMA DE STAMINA: adaptado exclusivamente da rotina SprintEvent/Sprinting
--- do script fornecido pelo usuario; demais ESPs do script de origem nao sao usados.
-do
-    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-    local sprintEvent
-    local character, humanoid, sprinting, normalWalkSpeed
-    local sprintHeld = false
-    local controllerSprintHeld = false
-    local mobileSprintHeld = false
-    local mobileRun, mobileConnection
-    local originalSprintConnections = {}
-    local originalMobileConnections = {}
-    local savedInterface = {}
-
-    local Stamina = {
-        enabled = false,
-        destroyed = false,
-        connections = {},
-    }
-    S.staminaController = Stamina
-
-    local function staminaConnect(signal, callback)
-        if Stamina.destroyed then return nil end
-        local c = signal:Connect(callback)
-        table.insert(Stamina.connections, c)
-        return c
-    end
-
-    local function findSprintEvent()
-        local events = ReplicatedStorage:FindFirstChild("Events")
-        sprintEvent = events and events:FindFirstChild("SprintEvent") or nil
-        if sprintEvent and not sprintEvent:IsA("RemoteEvent") then sprintEvent = nil end
-    end
-
-    local function refreshCharacter(char)
-        character = char
-        humanoid = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
-        local stats = char:FindFirstChild("Stats") or char:WaitForChild("Stats", 10)
-        sprinting = stats and stats:FindFirstChild("Sprinting") or nil
-        normalWalkSpeed = humanoid and humanoid.WalkSpeed or nil
-        sprintHeld, controllerSprintHeld, mobileSprintHeld = false, false, false
-    end
-
-    local function setConnectionsEnabled(list, value)
-        for _, connection in ipairs(list) do
-            pcall(function()
-                if value then connection:Enable() else connection:Disable() end
-            end)
-        end
-    end
-
-    local function captureConnections(signal, storage)
-        if not signal or type(getconnections) ~= "function" then return end
-        local ok, list = pcall(getconnections, signal)
-        if not ok or type(list) ~= "table" then return end
-        for _, connection in ipairs(list) do
-            local ours = (connection == mobileConnection)
-            if not ours then
-                local found = false
-                for _, recorded in ipairs(storage) do
-                    if recorded == connection then found = true break end
-                end
-                if not found then table.insert(storage, connection) end
-            end
-        end
-    end
-
-    local function isSprintWanted()
-        return Stamina.enabled and (sprintHeld or controllerSprintHeld or mobileSprintHeld)
-    end
-
-    -- Velocidade e flag Sprinting iguais as usadas pelo script enviado.
-    local function getRunSpeed()
-        local maxSpeed = LocalPlayer:GetAttribute("KM_MAX_PLAYER_SPEED")
-        if type(maxSpeed) == "number" and maxSpeed > 0 then return maxSpeed end
-        return humanoid and humanoid.Parent and humanoid.WalkSpeed or nil
-    end
-
-    local function applySpeedState()
-        if not humanoid or not humanoid.Parent or not normalWalkSpeed then return end
-        if isSprintWanted() then
-            local runSpeed = getRunSpeed()
-            if type(runSpeed) == "number" and runSpeed > 0 then
-                humanoid.WalkSpeed = runSpeed
-            end
-        else
-            humanoid.WalkSpeed = normalWalkSpeed
-        end
-    end
-
-    local function setSprintInterface(active)
-        local screenGui = PlayerGui:FindFirstChild("ScreenGui")
-        local runButton = screenGui and screenGui:FindFirstChild("MobileRun")
-        if not runButton then return end
-        local text = runButton:FindFirstChild("TextLabel")
-        if text then text.Text = active and "SPRINT: ON" or "SPRINT: OFF" end
-        pcall(function()
-            runButton.Image = active and "rbxassetid://11866539249"
-                or "rbxassetid://11866517702"
-        end)
-        local icon = screenGui:FindFirstChild("SprintIcon")
-        if icon and active then icon.Visible = false end
-    end
-
-    local function restoreSprintInterface()
-        for object, values in pairs(savedInterface) do
-            if object and object.Parent then
-                for property, value in pairs(values) do
-                    pcall(function() object[property] = value end)
-                end
-            end
-            savedInterface[object] = nil
-        end
-    end
-
-    local function rememberInterface()
-        local screenGui = PlayerGui:FindFirstChild("ScreenGui")
-        local runButton = screenGui and screenGui:FindFirstChild("MobileRun")
-        if not runButton then return end
-        if not savedInterface[runButton] then
-            local values = {}
-            pcall(function() values.Image = runButton.Image end)
-            savedInterface[runButton] = values
-        end
-        local text = runButton:FindFirstChild("TextLabel")
-        if text and not savedInterface[text] then savedInterface[text] = { Text = text.Text } end
-        local icon = screenGui:FindFirstChild("SprintIcon")
-        if icon and not savedInterface[icon] then savedInterface[icon] = { Visible = icon.Visible } end
-    end
-
-    local function sendSprint(value)
-        if not sprintEvent then findSprintEvent() end
-        if sprintEvent then
-            pcall(function() sprintEvent:FireServer(value) end)
-        end
-    end
-
-    local function startSprint()
-        if not Stamina.enabled then return end
-        if sprinting and sprinting.Parent then
-            pcall(function() sprinting.Value = true end)
-        end
-        applySpeedState()
-        setSprintInterface(true)
-        sendSprint(true)
-    end
-
-    local function stopSprint()
-        if sprinting and sprinting.Parent then
-            pcall(function() sprinting.Value = false end)
-        end
-        setSprintInterface(false)
-        sendSprint(false)
-        applySpeedState()
-    end
-
-    local function bindMobileRun()
-        local screenGui = PlayerGui:FindFirstChild("ScreenGui")
-        local button = screenGui and screenGui:FindFirstChild("MobileRun")
-        if button == mobileRun then return end
-        if mobileConnection then
-            mobileConnection:Disconnect()
-            mobileConnection = nil
-        end
-        if Stamina.enabled then setConnectionsEnabled(originalMobileConnections, true) end
-        table.clear(originalMobileConnections)
-        mobileRun = button
-        mobileSprintHeld = false
-        if not button then return end
-        -- Capture conexoes originais ANTES de conectar nosso proprio botao.
-        captureConnections(button.Activated, originalMobileConnections)
-        mobileConnection = staminaConnect(button.Activated, function()
-            if not Stamina.enabled then return end
-            mobileSprintHeld = not mobileSprintHeld
-            if mobileSprintHeld then startSprint() else stopSprint() end
-        end)
-        if Stamina.enabled then
-            setConnectionsEnabled(originalMobileConnections, false)
-            rememberInterface()
-        end
-    end
-
-    function Stamina:SetEnabled(value)
-        if self.destroyed or self.enabled == value then return end
-        self.enabled = value
-        if value then
-            findSprintEvent()
-            if sprintEvent then
-                captureConnections(sprintEvent.OnClientEvent, originalSprintConnections)
-                setConnectionsEnabled(originalSprintConnections, false)
-            end
-            bindMobileRun()
-            setConnectionsEnabled(originalMobileConnections, false)
-            rememberInterface()
-            if isSprintWanted() then startSprint() else applySpeedState() end
-        else
-            sprintHeld, controllerSprintHeld, mobileSprintHeld = false, false, false
-            stopSprint()
-            setConnectionsEnabled(originalSprintConnections, true)
-            setConnectionsEnabled(originalMobileConnections, true)
-            restoreSprintInterface()
-        end
-    end
-
-    function Stamina:Destroy()
-        if self.destroyed then return end
-        if self.enabled then self:SetEnabled(false) end
-        self.destroyed = true
-        for _, c in ipairs(self.connections) do
-            pcall(function() c:Disconnect() end)
-        end
-        table.clear(self.connections)
-        if S.staminaController == self then S.staminaController = nil end
-    end
-
-    refreshCharacter(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())
-    findSprintEvent()
-    bindMobileRun()
-
-    staminaConnect(LocalPlayer.CharacterAdded, function(char)
-        refreshCharacter(char)
-        task.defer(function()
-            if Stamina.destroyed then return end
-            bindMobileRun()
-            if Stamina.enabled then applySpeedState() end
-        end)
-    end)
-
-    staminaConnect(PlayerGui.DescendantAdded, function(object)
-        if object.Name == "MobileRun" then
-            task.defer(function()
-                if not Stamina.destroyed then bindMobileRun() end
-            end)
-        end
-    end)
-
-    -- Teclas de movimento continuam funcionando como corrida, nao como
-    -- atalhos de ligar/desligar funcionalidades. O toggle fica so no F6.
-    staminaConnect(UIS.InputBegan, function(input, processed)
-        if processed or not Stamina.enabled then return end
-        if input.KeyCode == Enum.KeyCode.LeftShift then
-            if not sprintHeld then sprintHeld = true startSprint() end
-        elseif input.KeyCode == Enum.KeyCode.ButtonR1 then
-            if not controllerSprintHeld then controllerSprintHeld = true startSprint() end
-        end
-    end)
-
-    staminaConnect(UIS.InputEnded, function(input)
-        if not Stamina.enabled then return end
-        if input.KeyCode == Enum.KeyCode.LeftShift then
-            sprintHeld = false
-            if not controllerSprintHeld and not mobileSprintHeld then stopSprint() end
-        elseif input.KeyCode == Enum.KeyCode.ButtonR1 then
-            controllerSprintHeld = false
-            if not sprintHeld and not mobileSprintHeld then stopSprint() end
-        end
-    end)
-
-    task.spawn(function()
-        while not Stamina.destroyed do
-            if Stamina.enabled then
-                if isSprintWanted() then
-                    if sprinting and sprinting.Parent then
-                        pcall(function() sprinting.Value = true end)
-                    end
-                    applySpeedState()
-                end
-            end
-            task.wait(0.22)
-        end
-    end)
-end
-
--- PAINEL UNIFICADO DW | F6
-do
-    local RunService = game:GetService("RunService")
-    local Lighting = game:GetService("Lighting")
-    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-    local old = PlayerGui:FindFirstChild("__DW_PANEL_F6")
-    if old then old:Destroy() end
-
-    local flags = {
-        GeneratorESP = enabled.GeneratorESP,
-        MonsterESP = enabled.MonsterESP,
-        PlayerESP = enabled.PlayerESP,
-        PlayerInfo = true,
-        ItemESP = enabled.ItemESP,
-        ItemTracer = false,
-        RareBillboard = true,
-        AutoSkill = S.skillEnabled,
-        InfiniteStamina = false,
-        FullBright = false,
-        FOV = false,
-    }
-    local camera = workspace.CurrentCamera
-    local initialFOV = camera and camera.FieldOfView or 70
-    S.restoreFOV = function()
-        local cam = workspace.CurrentCamera
-        if cam and flags.FOV then cam.FieldOfView = initialFOV end
-    end
-    local targetFOV = math.clamp(math.floor(initialFOV + 0.5), 40, 120)
-    local lightProperties = {"Brightness", "ClockTime", "FogEnd", "GlobalShadows", "Ambient"}
-    S.originalLighting = {}
-    for _, prop in ipairs(lightProperties) do S.originalLighting[prop] = Lighting[prop] end
-
-    local function applyLighting()
-        if flags.FullBright then
-            Lighting.Brightness = 2
-            Lighting.ClockTime = 12
-            Lighting.FogEnd = 1000000
-            Lighting.GlobalShadows = false
-            Lighting.Ambient = Color3.fromRGB(190, 190, 190)
-        else
-            for prop, value in pairs(S.originalLighting) do Lighting[prop] = value end
-        end
-    end
-
-    local function applyFOV()
-        local cam = workspace.CurrentCamera
-        if cam and flags.FOV and math.abs(cam.FieldOfView - targetFOV) > 0.05 then
-            cam.FieldOfView = targetFOV
-        end
-    end
-
-    local function clearTracers()
-        for item, beam in pairs(S.tracers) do
-            if beam then
-                local target = beam.Parent
-                beam:Destroy()
-                if target and target.Name == "__VickTracerTarget" then target:Destroy() end
-            end
-            S.tracers[item] = nil
-        end
-        if S.tracerAttachment then S.tracerAttachment:Destroy() S.tracerAttachment = nil end
-    end
-
-    local function updateTracers()
-        if not flags.ItemTracer then
-            if next(S.tracers) then clearTracers() end
-            return
-        end
-        local root = getRoot(LocalPlayer.Character)
-        if not root then clearTracers() return end
-        if not S.tracerAttachment or S.tracerAttachment.Parent ~= root then
-            clearTracers()
-            S.tracerAttachment = Instance.new("Attachment")
-            S.tracerAttachment.Name = "__VickTracerOrigin"
-            S.tracerAttachment.Parent = root
-        end
-        local seen = {}
-        for highlight in pairs(tracked.ItemESP) do
-            if highlight and highlight.Parent then
-                local item = highlight.Adornee
-                local part = item and (item:IsA("BasePart") and item
-                    or item:IsA("Model") and (item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart", true)))
-                if part and part.Parent and item:IsDescendantOf(CurrentRoom) then
-                    seen[item] = true
-                    if not S.tracers[item] then
-                        local target = Instance.new("Attachment")
-                        target.Name = "__VickTracerTarget"
-                        target.Parent = part
-                        local beam = Instance.new("Beam")
-                        beam.Name = "__VickItemTracer"
-                        beam.Attachment0 = S.tracerAttachment
-                        beam.Attachment1 = target
-                        beam.FaceCamera = true
-                        beam.Width0 = 0.055
-                        beam.Width1 = 0.055
-                        beam.Transparency = NumberSequence.new(0.12)
-                        beam.Color = ColorSequence.new(colors.ItemESP)
-                        beam.LightEmission = 1
-                        beam.Parent = target
-                        S.tracers[item] = beam
-                    end
-                end
-            end
-        end
-        for item, beam in pairs(S.tracers) do
-            if not seen[item] or not beam.Parent then
-                local attachment = beam.Parent
-                beam:Destroy()
-                if attachment and attachment.Name == "__VickTracerTarget" then attachment:Destroy() end
-                S.tracers[item] = nil
-            end
-        end
-    end
-
-    local function setFlag(key, value)
-        flags[key] = value
-        if enabled[key] ~= nil then
-            if enabled[key] ~= value then toggleESP(key) end
-        elseif key == "PlayerInfo" then
-            S.playerInfoEnabled = value
-            for bill in pairs(S.billboards) do
-                if bill.Parent then bill.Enabled = enabled.PlayerESP and value end
-            end
-        elseif key == "RareBillboard" then
-            if S.rareBillboardController and not S.rareBillboardController.destroyed then
-                S.rareBillboardController:SetEnabled(value)
-            end
-        elseif key == "AutoSkill" then
-            setSkillEnabled(value)
-        elseif key == "InfiniteStamina" then
-            if S.staminaController then S.staminaController:SetEnabled(value) end
-        elseif key == "FullBright" then
-            applyLighting()
-        elseif key == "FOV" then
-            if value then applyFOV()
-            elseif workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView = initialFOV end
-        elseif key == "ItemTracer" and not value then
-            clearTracers()
-        end
-    end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "__DW_PANEL_F6"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = false
-    gui.DisplayOrder = 150
-    gui.Parent = PlayerGui
-    S.gui = gui
-
-    local panel = Instance.new("Frame")
-    panel.Name = "Panel"
-    panel.Size = UDim2.fromOffset(330, 490)
-    panel.Position = UDim2.new(1, -350, 0.14, 0)
-    panel.BackgroundColor3 = Color3.fromRGB(9, 9, 9)
-    panel.BorderSizePixel = 0
-    panel.Active = true
-    panel.Parent = gui
-    local corner = Instance.new("UICorner", panel)
-    corner.CornerRadius = UDim.new(0, 12)
-    local outline = Instance.new("UIStroke", panel)
-    outline.Color = Color3.fromRGB(190, 190, 190)
-    outline.Thickness = 1
-
-    local header = Instance.new("Frame")
-    header.Size = UDim2.new(1, 0, 0, 46)
-    header.BackgroundTransparency = 1
-    header.Active = true
-    header.Parent = panel
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -65, 1, 0)
-    title.Position = UDim2.fromOffset(15, 0)
-    title.BackgroundTransparency = 1
-    title.Text = "Painel DW"
-    title.TextColor3 = Color3.fromRGB(250, 250, 250)
-    title.TextSize = 15
-    title.Font = Enum.Font.GothamBold
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = header
-
-    local close = Instance.new("TextButton")
-    close.Size = UDim2.fromOffset(29, 29)
-    close.Position = UDim2.new(1, -39, 0, 8)
-    close.BackgroundColor3 = Color3.fromRGB(38, 38, 38)
-    close.Text = "X"
-    close.TextColor3 = Color3.new(1, 1, 1)
-    close.TextSize = 13
-    close.Font = Enum.Font.GothamBold
-    close.Parent = header
-    Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
-    connect(close.MouseButton1Click, function() gui.Enabled = false end)
-
-    local scroll = Instance.new("ScrollingFrame")
-    scroll.Position = UDim2.fromOffset(12, 49)
-    scroll.Size = UDim2.new(1, -24, 1, -76)
-    scroll.BackgroundTransparency = 1
-    scroll.BorderSizePixel = 0
-    scroll.ScrollBarThickness = 4
-    scroll.ScrollBarImageColor3 = Color3.fromRGB(170, 170, 170)
-    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    scroll.CanvasSize = UDim2.fromOffset(0, 0)
-    scroll.Parent = panel
-    local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 7)
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Parent = scroll
-
-    local function textLabel(text, height)
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1, -5, 0, height)
-        label.BackgroundTransparency = 1
-        label.Text = text
-        label.TextColor3 = Color3.fromRGB(175, 175, 175)
-        label.TextSize = 11
-        label.Font = Enum.Font.GothamBold
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Parent = scroll
-        return label
-    end
-
-    local function makeToggle(labelText, key)
-        local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -6, 0, 35)
-        row.BackgroundColor3 = Color3.fromRGB(27, 27, 27)
-        row.BorderSizePixel = 0
-        row.Parent = scroll
-        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
-
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1, -92, 1, 0)
-        label.Position = UDim2.fromOffset(11, 0)
-        label.BackgroundTransparency = 1
-        label.Text = labelText
-        label.TextColor3 = Color3.fromRGB(238, 238, 238)
-        label.TextSize = 12
-        label.Font = Enum.Font.GothamMedium
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Parent = row
-
-        local button = Instance.new("TextButton")
-        button.Size = UDim2.fromOffset(65, 25)
-        button.Position = UDim2.new(1, -72, 0.5, -12)
-        button.TextSize = 11
-        button.Font = Enum.Font.GothamBold
-        button.TextColor3 = Color3.new(1, 1, 1)
-        button.Parent = row
-        Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
-        local function paint()
-            button.Text = flags[key] and "ON" or "OFF"
-            button.BackgroundColor3 = flags[key]
-                and Color3.fromRGB(245, 245, 245) or Color3.fromRGB(57, 57, 57)
-            button.TextColor3 = flags[key]
-                and Color3.fromRGB(12, 12, 12) or Color3.fromRGB(245, 245, 245)
-        end
+    paint()
+    conn(b.Activated, function()
+        local ok, err = pcall(setFlag, key, not flags[key])
+        if not ok then warn("[DW] " .. key .. " falhou: " .. tostring(err)) end
         paint()
-        connect(button.MouseButton1Click, function()
-            setFlag(key, not flags[key])
-            paint()
-        end)
-    end
-
-    textLabel("ESP", 19)
-    makeToggle("Geradores", "GeneratorESP")
-    makeToggle("Twisteds", "MonsterESP")
-    makeToggle("Jogadores", "PlayerESP")
-    makeToggle("Info jogadores / HP", "PlayerInfo")
-    makeToggle("Itens", "ItemESP")
-    makeToggle("Tracer dos itens", "ItemTracer")
-    textLabel("EXTRAS", 19)
-    makeToggle("Billboard Scraps / Goob / Gigi", "RareBillboard")
-    makeToggle("Auto Skill Check", "AutoSkill")
-    makeToggle("Infinite Stamina", "InfiniteStamina")
-    makeToggle("FullBright", "FullBright")
-    makeToggle("FOV personalizado", "FOV")
-
-    textLabel("FOV  |  40 a 120", 20)
-    local fovRow = Instance.new("Frame")
-    fovRow.Size = UDim2.new(1, -6, 0, 38)
-    fovRow.BackgroundColor3 = Color3.fromRGB(27, 27, 27)
-    fovRow.BorderSizePixel = 0
-    fovRow.Parent = scroll
-    Instance.new("UICorner", fovRow).CornerRadius = UDim.new(0, 7)
-
-    local function fovButton(txt, x, w)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.fromOffset(w, 28)
-        b.Position = UDim2.fromOffset(x, 5)
-        b.BackgroundColor3 = Color3.fromRGB(62, 62, 62)
-        b.Text = txt
-        b.TextColor3 = Color3.new(1, 1, 1)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 13
-        b.Parent = fovRow
-        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
-        return b
-    end
-    local minus = fovButton("-", 8, 34)
-    local plus = fovButton("+", 222, 34)
-    local reset = fovButton("R", 261, 30)
-    local valueBox = Instance.new("TextBox")
-    valueBox.Size = UDim2.fromOffset(164, 28)
-    valueBox.Position = UDim2.fromOffset(49, 5)
-    valueBox.BackgroundColor3 = Color3.fromRGB(9, 9, 9)
-    valueBox.TextColor3 = Color3.new(1, 1, 1)
-    valueBox.Font = Enum.Font.GothamBold
-    valueBox.TextSize = 14
-    valueBox.Text = tostring(targetFOV)
-    valueBox.ClearTextOnFocus = false
-    valueBox.Parent = fovRow
-    Instance.new("UICorner", valueBox).CornerRadius = UDim.new(0, 5)
-
-    local function setFov(v)
-        local n = tonumber(v)
-        if n then targetFOV = math.clamp(math.floor(n + 0.5), 40, 120) end
-        valueBox.Text = tostring(targetFOV)
-        applyFOV()
-    end
-    connect(minus.MouseButton1Click, function() setFov(targetFOV - 5) end)
-    connect(plus.MouseButton1Click, function() setFov(targetFOV + 5) end)
-    connect(reset.MouseButton1Click, function() setFov(initialFOV) end)
-    connect(valueBox.FocusLost, function() setFov(valueBox.Text) end)
-
-    local hint = Instance.new("TextLabel")
-    hint.Position = UDim2.new(0, 14, 1, -24)
-    hint.Size = UDim2.new(1, -28, 0, 18)
-    hint.BackgroundTransparency = 1
-    hint.Text = "F6: mostrar / esconder  •  arraste pelo titulo"
-    hint.TextColor3 = Color3.fromRGB(160, 160, 160)
-    hint.Font = Enum.Font.Gotham
-    hint.TextSize = 10
-    hint.Parent = panel
-
-    local dragging, dragStart, panelStart, dragInput = false, nil, nil, nil
-    connect(header.InputBegan, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragInput = input
-            dragStart = input.Position
-            panelStart = panel.Position
-        end
-    end)
-    connect(UIS.InputChanged, function(input)
-        if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local delta = input.Position - dragStart
-            panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X,
-                panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
-        end
-    end)
-    connect(UIS.InputEnded, function(input)
-        if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
-        end
-    end)
-    connect(UIS.InputBegan, function(input, processed)
-        if not processed and input.KeyCode == Enum.KeyCode.F6 then
-            gui.Enabled = not gui.Enabled
-        end
-    end)
-
-    local accumulator = 0
-    connect(RunService.Heartbeat, function(dt)
-        if S.destroyed then return end
-        accumulator += dt
-        if accumulator < 0.15 then return end
-        accumulator = 0
-        updateTracers()
-        applyFOV()
-        if flags.FullBright then applyLighting() end
     end)
 end
-print("[Painel DW] F6 abre/fecha | Stamina, ESP, FOV e extras")
+section("ESP — tudo inicia OFF")
+toggle("Geradores", "GeneratorESP")
+toggle("Twisteds", "MonsterESP")
+toggle("Jogadores", "PlayerESP")
+toggle("Info dos jogadores / HP", "PlayerInfo")
+toggle("Itens", "ItemESP")
+toggle("Tracer de itens", "ItemTracer")
+section("EXTRAS — tudo inicia OFF")
+toggle("Billboard Scraps / Goob / Gigi", "RareBillboard")
+toggle("Auto Skill Check", "AutoSkill")
+toggle("Infinite Stamina + Buff", "InfiniteStamina")
+toggle("FullBright", "FullBright")
+toggle("FOV personalizado", "FOV")
+section("FILTROS VISUAIS — iniciam ON")
+toggle("Ocultar pop-up da Vee", "HideVee")
+toggle("Ocultar mancha de ichor", "HideIchor")
+section("FOV — 40 a 120")
+local fovRow = Instance.new("Frame")
+fovRow.Size = UDim2.new(1, -6, 0, 38)
+fovRow.BackgroundColor3 = Color3.fromRGB(27, 27, 27)
+fovRow.Parent = scroll
+Instance.new("UICorner", fovRow).CornerRadius = UDim.new(0, 7)
+local function fovButton(txt, x, w)
+    local b = Instance.new("TextButton")
+    b.Position = UDim2.fromOffset(x, 5)
+    b.Size = UDim2.fromOffset(w, 28)
+    b.BackgroundColor3 = Color3.fromRGB(62, 62, 62)
+    b.Text = txt
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 13
+    b.Parent = fovRow
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    return b
+end
+local minus = fovButton("-", 8, 34)
+local plus = fovButton("+", 222, 34)
+local reset = fovButton("R", 261, 30)
+local valueBox = Instance.new("TextBox")
+valueBox.Position = UDim2.fromOffset(49, 5)
+valueBox.Size = UDim2.fromOffset(164, 28)
+valueBox.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+valueBox.TextColor3 = Color3.new(1, 1, 1)
+valueBox.Font = Enum.Font.GothamBold
+valueBox.TextSize = 14
+valueBox.Text = tostring(targetFOV)
+valueBox.ClearTextOnFocus = false
+valueBox.Parent = fovRow
+Instance.new("UICorner", valueBox).CornerRadius = UDim.new(0, 5)
+local function changeFOV(value)
+    local number = tonumber(value)
+    if number then targetFOV = math.clamp(math.floor(number + .5), 40, 120) end
+    valueBox.Text = tostring(targetFOV)
+    applyFOV()
+end
+conn(minus.Activated, function() changeFOV(targetFOV - 5) end)
+conn(plus.Activated, function() changeFOV(targetFOV + 5) end)
+conn(reset.Activated, function() changeFOV(originalFOV) end)
+conn(valueBox.FocusLost, function() changeFOV(valueBox.Text) end)
+local hint = Instance.new("TextLabel")
+hint.Position = UDim2.new(0, 10, 1, -23)
+hint.Size = UDim2.new(1, -20, 0, 17)
+hint.BackgroundTransparency = 1
+hint.Text = "F6 abre/fecha  •  arraste pelo título"
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 10
+hint.TextColor3 = Color3.fromRGB(175, 175, 175)
+hint.Parent = panel
+local dragging, dragStart, panelStart, dragInput = false, nil, nil, nil
+conn(header.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or
+        input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragInput = input
+        dragStart = input.Position
+        panelStart = panel.Position
+    end
+end)
+conn(UIS.InputChanged, function(input)
+    if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local delta = input.Position - dragStart
+        panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X,
+            panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
+    end
+end)
+conn(UIS.InputEnded, function(input)
+    if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+conn(UIS.InputBegan, function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.F6 then
+        gui.Enabled = not gui.Enabled
+    end
+end)
+print("[DW LEVE] F6 | Todos os recursos OFF; filtros Vee/Ichor ON (somente eventos)")
